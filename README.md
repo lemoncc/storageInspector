@@ -4,6 +4,10 @@ Chrome Manifest V3 浏览器扩展，用于管理当前页面的 **localStorage*
 
 当前版本：`1.7.7`
 
+## 界面预览
+
+![应用存储管理弹窗截图](./docs/screenshot.png)
+
 ## 功能
 
 - 按 Key **读取 / 写入 / 删除** localStorage、sessionStorage、Cookie
@@ -28,6 +32,8 @@ Chrome Manifest V3 浏览器扩展，用于管理当前页面的 **localStorage*
 .
 ├── manifest.json      # 扩展清单
 ├── icons/             # 扩展图标
+├── docs/              # 文档资源
+│   └── screenshot.png
 ├── popup/             # 弹窗 UI
 │   ├── index.html
 │   ├── index.css
