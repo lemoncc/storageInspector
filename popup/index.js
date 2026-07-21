@@ -93,12 +93,43 @@ let pageKeyCache = [];
 let pageEntriesCache = {};
 /** @type {Record<string, chrome.cookies.Cookie>} */
 let cookieDetailCache = {};
+/**
+ * 读取 cookie 时保留的绝对过期时间（unix 秒）
+ * Max-Age 留空时写入沿用，避免把「剩余秒数」当 Max-Age 导致过期被缩短
+ * @type {number | null}
+ */
+let cookiePreservedExpirationDate = null;
 /** @type {Array<{ key: string, source: string }>} */
 let suggestItems = [];
 let suggestActiveIndex = -1;
 let suggestBlurTimer = null;
 /** 备选请求序号，避免异步回写互相覆盖 */
 let suggestRequestId = 0;
+/** 页面 Key 缓存是否可用（联想过滤用，避免每次按键全量拉取） */
+let pageKeysCacheReady = false;
+/** 页面 Key 缓存拉取时间 */
+let pageKeysFetchedAt = 0;
+/** 联想防抖定时器 */
+let suggestDebounceTimer = null;
+/** 联想防抖间隔（毫秒） */
+const SUGGEST_DEBOUNCE_MS = 220;
+/** 页面 Key 缓存有效期（毫秒） */
+const PAGE_KEYS_CACHE_TTL_MS = 30000;
+
+/**
+ * 递归格式化还原表：路径 -> 展开前原始字符串
+ * @type {Map<string, string>}
+ */
+let nestedStringRestoreMap = new Map();
+/** 是否处于「已递归展开、尚未还原」状态 */
+let formatExpandActive = false;
+/** 格式化前的整段原文（还原表异常时的保底，避免把展开态写入） */
+let preFormatRootText = '';
+/**
+ * 格式化时的还原表备份（防止写入前还原表被意外清空）
+ * @type {Map<string, string> | null}
+ */
+let formatRestoreMapBackup = null;
 
 /**
  * 获取某存储类型最近一次 key 的缓存字段
@@ -630,11 +661,28 @@ function applyCookieDetailsToForm(cookie) {
   cookieHttpOnlyCheckbox.checked = Boolean(cookie.httpOnly);
   cookieSameSiteSelect.value = mapSameSiteFromApi(cookie.sameSite);
   if (cookie.session || !cookie.expirationDate) {
+    cookiePreservedExpirationDate = null;
     cookieMaxAgeInput.value = '';
+    cookieMaxAgeInput.placeholder = '秒，空=会话';
+    cookieMaxAgeInput.title = '';
   } else {
+    // 保留绝对过期时间；Max-Age 留空表示「保持原过期」，避免剩余秒数回填后越写越短
+    cookiePreservedExpirationDate = cookie.expirationDate;
+    cookieMaxAgeInput.value = '';
     const remainSeconds = Math.max(0, Math.floor(cookie.expirationDate - Date.now() / 1000));
-    cookieMaxAgeInput.value = String(remainSeconds);
+    const expireText = new Date(cookie.expirationDate * 1000).toLocaleString();
+    cookieMaxAgeInput.placeholder = '空=保持原过期';
+    cookieMaxAgeInput.title = `原过期：${expireText}（剩余约 ${remainSeconds} 秒）。填写秒数则按相对时间重写`;
   }
+}
+
+/**
+ * 清空保留的 cookie 过期时间，并恢复 Max-Age 默认提示
+ */
+function clearCookiePreservedExpiration() {
+  cookiePreservedExpirationDate = null;
+  cookieMaxAgeInput.placeholder = '秒，空=会话';
+  cookieMaxAgeInput.title = '';
 }
 
 /**
@@ -890,6 +938,7 @@ async function readCookieViaApi(tab, key) {
   const cookie = pickPreferredCookie(matchedCookies, pathname);
 
   if (!cookie) {
+    clearCookiePreservedExpiration();
     return { ...routeInfo, value: null, cookie: null, httpOnly: false };
   }
 
@@ -968,7 +1017,7 @@ async function listCookiesViaApi(tab) {
  * @param {chrome.tabs.Tab} tab
  * @param {string} key
  * @param {string} value
- * @param {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string, httpOnly: boolean }} options
+ * @param {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string, httpOnly: boolean, expirationDate?: number | null }} options
  */
 async function writeCookieViaApi(tab, key, value, options) {
   const routeInfo = buildRouteInfoFromTab(tab);
@@ -982,6 +1031,16 @@ async function writeCookieViaApi(tab, key, value, options) {
   if (sameSite === 'no_restriction') {
     secure = true;
     cookieSecureCheckbox.checked = true;
+  }
+
+  // 写入前删除同名旧 cookie，避免改 Path/Domain 后旧条目残留
+  const existingCookies = (await collectTabCookies(tab)).filter((cookie) => cookie.name === key);
+  for (const cookie of existingCookies) {
+    await chrome.cookies.remove({
+      url: buildCookieUrl(cookie, tab),
+      name: key,
+      storeId: cookie.storeId,
+    });
   }
 
   /** @type {chrome.cookies.SetDetails} */
@@ -1002,6 +1061,13 @@ async function writeCookieViaApi(tab, key, value, options) {
   }
   if (options.maxAge !== null && options.maxAge !== undefined && Number.isFinite(options.maxAge)) {
     details.expirationDate = Date.now() / 1000 + options.maxAge;
+  } else if (
+    options.expirationDate !== null &&
+    options.expirationDate !== undefined &&
+    Number.isFinite(options.expirationDate)
+  ) {
+    // 沿用读取时的绝对过期时间
+    details.expirationDate = options.expirationDate;
   }
   if (storeId) {
     details.storeId = storeId;
@@ -1094,7 +1160,7 @@ async function deleteCookieViaApi(tab, key, options = {}) {
  * 批量通过 chrome.cookies 写入
  * @param {chrome.tabs.Tab} tab
  * @param {Record<string, string>} entries
- * @param {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string, httpOnly: boolean }} options
+ * @param {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string, httpOnly: boolean, expirationDate?: number | null }} options
  */
 async function writeCookiesBatchViaApi(tab, entries, options) {
   const routeInfo = buildRouteInfoFromTab(tab);
@@ -1282,7 +1348,7 @@ function updateKeyPlaceholder() {
 
 /**
  * 读取 Cookie 写入表单选项
- * @returns {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string, httpOnly: boolean }}
+ * @returns {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string, httpOnly: boolean, expirationDate: number | null }}
  */
 function getCookieWriteOptions() {
   const path = cookiePathInput.value.trim() || '/';
@@ -1299,7 +1365,11 @@ function getCookieWriteOptions() {
     cookieSecureCheckbox.checked = true;
   }
 
-  return { path, maxAge, domain, secure, sameSite, httpOnly };
+  // Max-Age 有值：按相对秒数；否则若有保留的绝对过期则沿用；再否则为会话 cookie
+  const expirationDate =
+    maxAge === null && cookiePreservedExpirationDate !== null ? cookiePreservedExpirationDate : null;
+
+  return { path, maxAge, domain, secure, sameSite, httpOnly, expirationDate };
 }
 
 /**
@@ -1586,6 +1656,8 @@ async function refreshPageKeys(renderList = false) {
     pageKeyCache = Array.isArray(pageData.keys) ? pageData.keys : [];
     pageEntriesCache =
       pageData.entries && typeof pageData.entries === 'object' ? pageData.entries : {};
+    pageKeysCacheReady = true;
+    pageKeysFetchedAt = Date.now();
     if (renderList || !keysPanelEl.hidden) {
       renderKeysList(keysFilterInput.value.trim());
     }
@@ -1594,6 +1666,8 @@ async function refreshPageKeys(renderList = false) {
     pageKeyCache = [];
     pageEntriesCache = {};
     cookieDetailCache = {};
+    pageKeysCacheReady = false;
+    pageKeysFetchedAt = 0;
     if (renderList || !keysPanelEl.hidden) {
       renderKeysList(keysFilterInput.value.trim());
     }
@@ -1789,7 +1863,23 @@ function renderKeySuggest(options = {}) {
 }
 
 /**
- * 刷新并展示联想：先历史 3 条，再加载全部页面 Key
+ * 页面 Key 缓存是否仍可用于联想过滤
+ * @returns {boolean}
+ */
+function isPageKeysCacheFresh() {
+  return pageKeysCacheReady && Date.now() - pageKeysFetchedAt < PAGE_KEYS_CACHE_TTL_MS;
+}
+
+/**
+ * 使页面 Key 缓存失效（切换类型等）
+ */
+function invalidatePageKeysCache() {
+  pageKeysCacheReady = false;
+  pageKeysFetchedAt = 0;
+}
+
+/**
+ * 刷新并展示联想：先历史 3 条；有缓存则本地过滤，否则防抖后再拉页面 Key
  * @param {boolean} [forceShow]
  */
 async function updateKeySuggest(forceShow = false) {
@@ -1801,30 +1891,43 @@ async function updateKeySuggest(forceShow = false) {
     return;
   }
 
-  // 先立刻展示历史倒序 3 条；若暂无历史，显示加载态，避免被误判为「没备选」
+  // 缓存仍新鲜：只做本地过滤，避免 Cookie 场景每次按键全量拉取
+  if (isPageKeysCacheFresh()) {
+    suggestItems = buildSuggestItems(query);
+    suggestActiveIndex = suggestItems.length ? 0 : -1;
+    renderKeySuggest({ loading: false });
+    return;
+  }
+
+  // 无缓存：先立刻展示历史；异步防抖后再拉页面 Key
   suggestItems = buildHistorySuggestItems(query);
   suggestActiveIndex = suggestItems.length ? 0 : -1;
   renderKeySuggest({ loading: !suggestItems.length });
 
-  // 再异步加载页面全部 Key 并追加
-  try {
-    await refreshPageKeys(false);
-  } catch {
-    // 页面 Key 加载失败时保留历史备选
+  if (suggestDebounceTimer) {
+    clearTimeout(suggestDebounceTimer);
   }
 
-  // 过期请求或已失焦：不再回写，防止把正在展示的列表清掉
-  if (requestId !== suggestRequestId) {
-    return;
-  }
-  if (!isStorageKeyInputFocused()) {
-    return;
-  }
+  suggestDebounceTimer = setTimeout(async () => {
+    suggestDebounceTimer = null;
+    try {
+      await refreshPageKeys(false);
+    } catch {
+      // 页面 Key 加载失败时保留历史备选
+    }
 
-  const latestQuery = storageKeyInput.value;
-  suggestItems = buildSuggestItems(latestQuery);
-  suggestActiveIndex = suggestItems.length ? 0 : -1;
-  renderKeySuggest({ loading: false });
+    // 过期请求或已失焦：不再回写，防止把正在展示的列表清掉
+    if (requestId !== suggestRequestId) {
+      return;
+    }
+    if (!isStorageKeyInputFocused()) {
+      return;
+    }
+
+    suggestItems = buildSuggestItems(storageKeyInput.value);
+    suggestActiveIndex = suggestItems.length ? 0 : -1;
+    renderKeySuggest({ loading: false });
+  }, forceShow ? 0 : SUGGEST_DEBOUNCE_MS);
 }
 
 /**
@@ -1862,6 +1965,9 @@ async function switchStorageType(storageType) {
   pageKeyCache = [];
   pageEntriesCache = {};
   cookieDetailCache = {};
+  invalidatePageKeysCache();
+  clearCookiePreservedExpiration();
+  cookieMaxAgeInput.value = '';
 
   const historyList = await loadAndRenderKeyHistory();
   storageKeyInput.value = historyList[0] || '';
@@ -1957,6 +2063,72 @@ async function handleRead() {
 }
 
 /**
+ * 写入前处理值：还原格式化展开态，并压缩合法 JSON
+ * 不依赖 formatExpandActive 单一开关，避免状态丢失后把展开态写进去
+ * @param {string} rawText
+ * @returns {{ text: string, restoredCount: number, usedFallback: boolean, minified: boolean }}
+ */
+function prepareValueForWrite(rawText) {
+  let text = rawText;
+  let restoredCount = 0;
+  let usedFallback = false;
+  let minified = false;
+  const restoreMap = getActiveFormatRestoreMap();
+
+  // 1) 优先按还原表把嵌套字符串还原回去
+  if (restoreMap && restoreMap.size > 0) {
+    try {
+      const parsed = JSON.parse(text.trim());
+      const previousMap = nestedStringRestoreMap;
+      nestedStringRestoreMap = restoreMap;
+      try {
+        const counter = { restoredCount: 0 };
+        const restored = deepRestoreJsonValue(parsed, counter);
+        if (counter.restoredCount > 0) {
+          text = JSON.stringify(restored);
+          restoredCount = counter.restoredCount;
+          minified = true;
+        }
+      } finally {
+        nestedStringRestoreMap = previousMap;
+      }
+    } catch {
+      // 继续走原文回退
+    }
+  }
+
+  // 2) 还原表无效但还留着格式化前原文 → 直接回退原文（格式化仅作阅读）
+  if (restoredCount === 0 && preFormatRootText) {
+    text = preFormatRootText;
+    usedFallback = true;
+  }
+
+  // 3) 合法 JSON 一律压缩（去掉缩进）；已 minify 的再 parse 一次也无妨
+  try {
+    text = JSON.stringify(JSON.parse(text.trim()));
+    minified = true;
+  } catch {
+    // 非 JSON 保持原样
+  }
+
+  return { text, restoredCount, usedFallback, minified };
+}
+
+/**
+ * 获取当前可用的格式化还原表
+ * @returns {Map<string, string> | null}
+ */
+function getActiveFormatRestoreMap() {
+  if (nestedStringRestoreMap.size > 0) {
+    return nestedStringRestoreMap;
+  }
+  if (formatRestoreMapBackup && formatRestoreMapBackup.size > 0) {
+    return formatRestoreMapBackup;
+  }
+  return null;
+}
+
+/**
  * 将文本框中的值写入当前页面存储
  */
 async function handleWrite() {
@@ -1969,12 +2141,18 @@ async function handleWrite() {
     return;
   }
 
-  const value = valueInput.value;
-  if (!value) {
+  if (!valueInput.value) {
     setActionStatus('请先粘贴或输入要写入的值', 'error');
     valueInput.focus();
     return;
   }
+
+  // 写入前始终做还原 + 压缩，避免展开态/缩进态直接入库
+  const prepared = prepareValueForWrite(valueInput.value);
+  let value = prepared.text;
+  valueInput.value = value;
+  autoResizeValueInput();
+  updateValueMeta();
 
   try {
     const tab = await getActiveTab();
@@ -2005,7 +2183,15 @@ async function handleWrite() {
     }
 
     setBusy(true);
-    setActionStatus('写入中...');
+    if (prepared.usedFallback) {
+      setActionStatus('已回退格式化前原文并压缩，写入中...');
+    } else if (prepared.restoredCount > 0) {
+      setActionStatus(`已还原 ${prepared.restoredCount} 处并压缩，写入中...`);
+    } else if (prepared.minified) {
+      setActionStatus('已压缩，写入中...');
+    } else {
+      setActionStatus('写入中...');
+    }
 
     const cookieOptions =
       currentStorageType === STORAGE_TYPES.cookie ? getCookieWriteOptions() : undefined;
@@ -2016,6 +2202,8 @@ async function handleWrite() {
       value,
       cookieOptions
     );
+    // 写入成功后再清格式化状态，避免确认取消后丢还原信息
+    clearFormatRestoreState();
     valueInput.value = pageData.value ?? value;
     autoResizeValueInput();
     updateValueMeta();
@@ -2036,6 +2224,8 @@ async function handleWrite() {
       const parts = [`path=${cookieOptions.path}`];
       if (cookieOptions.maxAge !== null) {
         parts.push(`Max-Age=${cookieOptions.maxAge}`);
+      } else if (cookieOptions.expirationDate) {
+        parts.push(`保持过期至 ${new Date(cookieOptions.expirationDate * 1000).toLocaleString()}`);
       } else {
         parts.push('会话 cookie');
       }
@@ -2054,8 +2244,16 @@ async function handleWrite() {
       cookieTip = `（${parts.join('，')}）`;
     }
 
+    let prepareTip = '';
+    if (prepared.usedFallback) {
+      prepareTip = '，已回退格式化前原文';
+    } else if (prepared.restoredCount > 0) {
+      prepareTip = `，已还原 ${prepared.restoredCount} 处嵌套字符串`;
+    } else if (prepared.minified) {
+      prepareTip = '，已压缩';
+    }
     setActionStatus(
-      `写入成功：${getStorageTypeLabel(currentStorageType)} / ${key}（长度 ${value.length}）${cookieTip}`,
+      `写入成功：${getStorageTypeLabel(currentStorageType)} / ${key}（长度 ${value.length}）${cookieTip}${prepareTip}`,
       'success'
     );
 
@@ -2137,6 +2335,10 @@ async function handleDelete() {
     valueInput.value = '';
     autoResizeValueInput();
     updateValueMeta();
+    if (currentStorageType === STORAGE_TYPES.cookie) {
+      clearCookiePreservedExpiration();
+      cookieMaxAgeInput.value = '';
+    }
     await pushKeyHistory(key);
     await saveLastValue('');
     setActionStatus(`已删除：${typeLabel} / ${key}`, 'success');
@@ -2324,7 +2526,74 @@ async function handlePaste() {
 }
 
 /**
- * 宽松解析对象/数组文本（兼容尾逗号、JS 对象字面量）
+ * 将对象字面量中的函数表达式替换为 JSON 字符串，便于安全 JSON.parse
+ * （扩展 CSP 禁止 new Function/eval，不能执行代码解析）
+ * @param {string} text
+ * @returns {string}
+ */
+function replaceFunctionsWithJsonStrings(text) {
+  let result = '';
+  let index = 0;
+
+  while (index < text.length) {
+    const colonIndex = text.indexOf(':', index);
+    if (colonIndex < 0) {
+      result += text.slice(index);
+      break;
+    }
+
+    result += text.slice(index, colonIndex + 1);
+    let cursor = colonIndex + 1;
+    while (cursor < text.length && /\s/.test(text[cursor])) {
+      cursor += 1;
+    }
+
+    const remain = text.slice(cursor);
+    let funcStart = -1;
+    let bodyStart = -1;
+
+    // key: function ... { / key: async function ... {
+    const classicMatch = remain.match(/^(async\s+)?function\b/);
+    // key: (...) => { 或 key: async (...) => {
+    const arrowMatch = remain.match(/^(async\s*)?\([^)]*\)\s*=>\s*\{/);
+    // key: name => { / key: async name => {
+    const arrowIdentMatch = remain.match(/^(async\s+)?[A-Za-z_$][\w$]*\s*=>\s*\{/);
+
+    if (classicMatch) {
+      funcStart = cursor;
+      const braceIndex = text.indexOf('{', cursor);
+      if (braceIndex >= 0) {
+        bodyStart = braceIndex;
+      }
+    } else if (arrowMatch) {
+      funcStart = cursor;
+      bodyStart = cursor + arrowMatch[0].length - 1;
+    } else if (arrowIdentMatch) {
+      funcStart = cursor;
+      bodyStart = cursor + arrowIdentMatch[0].length - 1;
+    }
+
+    if (funcStart >= 0 && bodyStart >= 0 && text[bodyStart] === '{') {
+      const bodyText = sliceBalancedFragment(text, bodyStart);
+      if (bodyText) {
+        const funcEnd = bodyStart + bodyText.length;
+        const funcSource = text.slice(funcStart, funcEnd);
+        result += JSON.stringify(funcSource);
+        index = funcEnd;
+        continue;
+      }
+    }
+
+    // 未识别为函数：原样输出当前空白，继续从空白后扫描
+    result += text.slice(colonIndex + 1, cursor);
+    index = cursor;
+  }
+
+  return result;
+}
+
+/**
+ * 宽松解析对象/数组文本（兼容尾逗号；不含 eval，遵守扩展 CSP）
  * @param {string} text
  * @returns {any}
  */
@@ -2348,9 +2617,10 @@ function parseStructuredData(text) {
     // continue
   }
 
-  // 按 JS 表达式解析（兼容未加引号 key、单引号等）
+  // 将函数体替换为字符串后再解析（避免 new Function 触发 CSP 报错）
   try {
-    const result = new Function(`"use strict"; return (${trimmed});`)();
+    const sanitized = replaceFunctionsWithJsonStrings(trimmed).replace(/,\s*([\]}])/g, '$1');
+    const result = JSON.parse(sanitized);
     if (result !== null && typeof result === 'object') {
       return result;
     }
@@ -2492,16 +2762,24 @@ function extractBalancedJsonFragment(text) {
 
 /**
  * 递归格式化时记录：路径 -> 展开前的原始字符串
- * 压缩时一律按原文还原，避免函数字段被 JSON.stringify 丢弃或空白被改写
- * @type {Map<string, string>}
+ * （状态变量已在文件前部声明：nestedStringRestoreMap / formatExpandActive / preFormatRootText / formatRestoreMapBackup）
  */
-let nestedStringRestoreMap = new Map();
 
 /**
- * 清空嵌套字符串还原表
+ * 清空格式化展开态与还原信息
+ */
+function clearFormatRestoreState() {
+  nestedStringRestoreMap.clear();
+  formatExpandActive = false;
+  preFormatRootText = '';
+  formatRestoreMapBackup = null;
+}
+
+/**
+ * 清空嵌套字符串还原表（兼容旧调用）
  */
 function clearNestedStringRestoreMap() {
-  nestedStringRestoreMap.clear();
+  clearFormatRestoreState();
 }
 
 /**
@@ -2654,7 +2932,9 @@ function handleFormatJson() {
 
   try {
     const parsed = JSON.parse(text);
-    clearNestedStringRestoreMap();
+    // 先清旧状态，再保留本次格式化前原文
+    clearFormatRestoreState();
+    preFormatRootText = text;
     const counter = { expandedCount: 0 };
     const formatted = deepFormatJsonValue(parsed, counter);
     // 用展示序列化，避免箭头函数等被普通 JSON.stringify 丢弃
@@ -2662,14 +2942,20 @@ function handleFormatJson() {
     autoResizeValueInput();
     updateValueMeta();
     if (counter.expandedCount > 0) {
+      formatExpandActive = true;
+      formatRestoreMapBackup = new Map(nestedStringRestoreMap);
       setActionStatus(
-        `已递归格式化（解析 ${counter.expandedCount} 处嵌套对象；压缩时按原文还原，可安全写入）`,
+        `已递归格式化（解析 ${counter.expandedCount} 处嵌套对象；写入前会自动还原，不会写展开态）`,
         'success'
       );
     } else {
+      preFormatRootText = '';
+      formatExpandActive = false;
+      formatRestoreMapBackup = null;
       setActionStatus('已格式化 JSON', 'success');
     }
   } catch {
+    clearFormatRestoreState();
     setActionStatus('不是合法 JSON，无法格式化', 'error');
   }
 }
@@ -2685,14 +2971,30 @@ function handleCompressJson() {
   }
 
   try {
+    const restoreMap = getActiveFormatRestoreMap();
     const parsed = JSON.parse(text);
     const counter = { restoredCount: 0 };
-    const restored =
-      nestedStringRestoreMap.size > 0 ? deepRestoreJsonValue(parsed, counter) : parsed;
+    let restored = parsed;
+    if (restoreMap && restoreMap.size > 0) {
+      const previousMap = nestedStringRestoreMap;
+      nestedStringRestoreMap = restoreMap;
+      try {
+        restored = deepRestoreJsonValue(parsed, counter);
+      } finally {
+        nestedStringRestoreMap = previousMap;
+      }
+    } else if (formatExpandActive && preFormatRootText) {
+      valueInput.value = JSON.stringify(JSON.parse(preFormatRootText));
+      autoResizeValueInput();
+      updateValueMeta();
+      clearFormatRestoreState();
+      setActionStatus('还原表失效，已回退格式化前原文并压缩', 'success');
+      return;
+    }
     valueInput.value = JSON.stringify(restored);
     autoResizeValueInput();
     updateValueMeta();
-    clearNestedStringRestoreMap();
+    clearFormatRestoreState();
     if (counter.restoredCount > 0) {
       setActionStatus(`已压缩并还原 ${counter.restoredCount} 处嵌套字符串，可安全写入`, 'success');
     } else {
