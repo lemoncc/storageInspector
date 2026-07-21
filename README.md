@@ -2,7 +2,7 @@
 
 Chrome Manifest V3 浏览器扩展，用于管理当前页面的 **localStorage**、**sessionStorage** 与 **Cookie**（含 HttpOnly）。
 
-当前版本：`1.7.7`
+当前版本：`2.0.3`
 
 ## 界面预览
 
@@ -10,12 +10,27 @@ Chrome Manifest V3 浏览器扩展，用于管理当前页面的 **localStorage*
 
 ## 功能
 
-- 按 Key **读取 / 写入 / 删除** localStorage、sessionStorage、Cookie
-- Cookie 支持 Path、Domain、Max-Age、SameSite、Secure、**HttpOnly**
-- **历史记录**与 Key **联想**
-- **全部 Key** 浏览、筛选、刷新
+- **表格化管理**：三列 Key / 值 / 操作，支持在表格内直接改 Key 与值
+- 行内 **编辑（JSON 弹窗，含格式化 / 压缩）/ 复制 / 粘贴 / 保存 / 删除**
+- 表格底部 **增加** 草稿行，填写后保存写入
+- 切换 **localStorage / sessionStorage / Cookie**，顶部筛选与刷新
+- Cookie 支持 Path、Domain、Max-Age、SameSite、Secure、**HttpOnly**（属性栏随选中行回填）
 - **导入 / 导出** JSON（Cookie 可带完整属性）
-- 值区支持递归格式化、压缩、复制、粘贴
+- 工具栏 **JSON查看 / JSON编辑**：以一个对象查看或批量改写当前表全部 key/值
+- 工具栏 **清空**：一键删除当前类型下全部条目（需确认）
+
+## 功能落位
+
+| 功能 | 位置 |
+|------|------|
+| 存储类型切换 | 顶部 Tabs |
+| 筛选 / 刷新 / JSON查看 / JSON编辑 / 导入 / 导出 / 清空 | 标题右侧工具栏 |
+| Cookie 属性 | Tabs 下方属性栏（选中行回填；新增用栏内默认值） |
+| 浏览与编辑全部条目 | 主表格 |
+| 复制 / 粘贴 / 保存 / 删除 | 行内「操作」列 |
+| 单行 JSON 编辑（含格式化 / 压缩 / 应用到行） | 行内「编辑」打开大弹窗 |
+| 全部数据 JSON 查看 / 编辑 | 工具栏「JSON查看」「JSON编辑」，编辑后「写入全部」 |
+| 新增条目 | 表格底部「+ 增加」 |
 
 ## 安装（开发者模式）
 
@@ -55,9 +70,9 @@ Chrome Manifest V3 浏览器扩展，用于管理当前页面的 **localStorage*
 ## 使用提示
 
 - 系统页（如 `chrome://`）、扩展页、应用商店页不支持读写
-- Cookie 同名多 Path 时，建议从「全部 Key」点选后再删，以确保 Path / Domain 匹配
+- Cookie 同名多 Path 时，先选中对应行（确认 Path / Domain 徽章）再删或改，以确保精确匹配
 - 写入空字符串会被拒绝，清空请使用「删除」
-- 快捷键：Key 输入框 `Enter` 读取；`Cmd/Ctrl + Enter` 写入
+- localStorage / sessionStorage 在表格内改 Key 后保存，会按「重命名」处理（删旧写新）
 
 ## License
 
