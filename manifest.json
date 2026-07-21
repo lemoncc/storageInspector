@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "应用存储读/写",
+  "version": "1.6.0",
+  "description": "读取/写入当前页面 localStorage、sessionStorage、cookie 指定 key 的值",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "action": {
+    "default_popup": "popup/index.html",
+    "default_title": "应用存储读/写",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

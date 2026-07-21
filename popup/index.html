@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>应用存储读/写</title>
+    <link rel="stylesheet" href="index.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <h1 class="title">
+          应用存储读/写
+          <span class="subtitle">（在当前路由读取 / 粘贴写入指定 key）</span>
+        </h1>
+        <label class="auto-read-toggle" title="打开弹窗或切换类型时，若已有 key 则自动读取">
+          <input id="autoReadToggle" type="checkbox" checked />
+          <span>打开自动读取</span>
+        </label>
+      </header>
+
+      <section class="route-section is-collapsed" id="routeSection">
+        <button id="routeToggleBtn" class="route-header" type="button" aria-expanded="false">
+          <span class="label">当前路由信息：</span>
+          <span class="route-arrow" aria-hidden="true"></span>
+        </button>
+        <div id="routeInfo" class="route-info">加载中...</div>
+      </section>
+
+      <section class="tab-section" id="storageTypeTabs" role="tablist" aria-label="存储类型">
+        <button
+          class="tab-item is-active"
+          type="button"
+          role="tab"
+          data-type="localStorage"
+          aria-selected="true"
+          tabindex="0"
+        >
+          localStorage
+        </button>
+        <button
+          class="tab-item"
+          type="button"
+          role="tab"
+          data-type="sessionStorage"
+          aria-selected="false"
+          tabindex="-1"
+        >
+          sessionStorage
+        </button>
+        <button
+          class="tab-item"
+          type="button"
+          role="tab"
+          data-type="cookie"
+          aria-selected="false"
+          tabindex="-1"
+        >
+          cookie
+        </button>
+      </section>
+
+      <section class="form-section">
+        <div class="key-row">
+          <div class="input-wrap">
+            <input
+              id="storageKey"
+              class="input"
+              type="text"
+              placeholder="输入 localStorage Key"
+              aria-label="Storage Key"
+              aria-autocomplete="list"
+              aria-controls="keySuggestList"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button id="clearKeyBtn" class="input-clear-btn" type="button" hidden aria-label="清空 Key">
+              ×
+            </button>
+            <ul id="keySuggestList" class="key-suggest" role="listbox" hidden></ul>
+          </div>
+          <button id="readBtn" class="btn btn-primary" type="button">读取</button>
+          <button id="browseKeysBtn" class="btn btn-secondary" type="button">全部 Key</button>
+        </div>
+
+        <div class="history-panel" id="historyPanel" hidden>
+          <div class="history-toolbar">
+            <span class="history-toolbar-label">历史 Key</span>
+            <button id="clearHistoryBtn" class="history-clear-all" type="button">清空</button>
+          </div>
+          <div class="history-row" id="historyRow"></div>
+        </div>
+
+        <div class="keys-panel" id="keysPanel" hidden>
+          <div class="keys-toolbar">
+            <input
+              id="keysFilterInput"
+              class="keys-filter"
+              type="text"
+              placeholder="筛选 key"
+              spellcheck="false"
+              autocomplete="off"
+            />
+            <button id="refreshKeysBtn" class="btn btn-ghost" type="button">刷新</button>
+            <button id="exportBtn" class="btn btn-ghost" type="button">导出</button>
+            <button id="importBtn" class="btn btn-ghost" type="button">导入</button>
+            <input id="importFileInput" type="file" accept="application/json,.json" hidden />
+          </div>
+          <div id="keysList" class="keys-list"></div>
+          <p id="keysEmptyTip" class="keys-empty" hidden>暂无 key</p>
+        </div>
+
+        <div class="cookie-bar" id="cookieOptions" hidden>
+          <div class="cookie-bar-head">
+            <span class="cookie-bar-title">Cookie 属性</span>
+            <label class="cookie-secure">
+              <input id="cookieSecure" type="checkbox" />
+              <span>Secure</span>
+            </label>
+          </div>
+          <div class="cookie-bar-fields">
+            <label class="cookie-cell">
+              <span class="cookie-cell-label">Path</span>
+              <input id="cookiePath" class="cookie-control" type="text" value="/" spellcheck="false" />
+            </label>
+            <label class="cookie-cell">
+              <span class="cookie-cell-label">Max-Age</span>
+              <input
+                id="cookieMaxAge"
+                class="cookie-control"
+                type="number"
+                min="0"
+                placeholder="秒，空=会话"
+                spellcheck="false"
+              />
+            </label>
+            <label class="cookie-cell">
+              <span class="cookie-cell-label">Domain</span>
+              <input id="cookieDomain" class="cookie-control" type="text" placeholder="可选" spellcheck="false" />
+            </label>
+            <label class="cookie-cell">
+              <span class="cookie-cell-label">SameSite</span>
+              <select id="cookieSameSite" class="cookie-control">
+                <option value="">默认</option>
+                <option value="Lax">Lax</option>
+                <option value="Strict">Strict</option>
+                <option value="None">None</option>
+              </select>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <section class="result-section">
+        <div class="result-header">
+          <label class="label" for="valueInput">值（可粘贴后写入）</label>
+          <div class="result-actions">
+            <button id="formatJsonBtn" class="btn btn-ghost" type="button">格式化</button>
+            <button id="compressJsonBtn" class="btn btn-ghost" type="button">压缩</button>
+            <button id="pasteBtn" class="btn btn-ghost" type="button">粘贴</button>
+            <button id="copyBtn" class="btn btn-ghost" type="button">复制</button>
+            <button id="clearBtn" class="btn btn-ghost" type="button">清空</button>
+          </div>
+        </div>
+        <textarea
+          id="valueInput"
+          class="value-input"
+          placeholder="读取结果会显示在这里；也可粘贴值后点击下方「写入」（Cmd/Ctrl+Enter）"
+          spellcheck="false"
+        ></textarea>
+        <div class="value-meta">
+          <span id="valueByteMeta" class="value-byte-meta"></span>
+          <span id="valueJsonMeta" class="value-json-meta"></span>
+        </div>
+        <div class="write-row">
+          <button id="writeBtn" class="btn btn-success" type="button">写入</button>
+          <button id="deleteBtn" class="btn btn-danger" type="button">删除</button>
+        </div>
+        <p id="statusText" class="status"></p>
+      </section>
+    </div>
+
+    <dialog id="confirmDialog" class="confirm-dialog">
+      <form method="dialog" class="confirm-form">
+        <h2 id="confirmTitle" class="confirm-title"></h2>
+        <pre id="confirmBody" class="confirm-body"></pre>
+        <div class="confirm-actions">
+          <button value="cancel" class="btn btn-secondary" type="submit">取消</button>
+          <button id="confirmOkBtn" value="ok" class="btn btn-primary" type="submit">确认</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="index.js"></script>
+  </body>
+</html>
