@@ -9,23 +9,8 @@
   <body>
     <div class="app">
       <header class="header">
-        <h1 class="title">
-          应用存储读/写
-          <span class="subtitle">（在当前路由读取 / 粘贴写入指定 key）</span>
-        </h1>
-        <label class="auto-read-toggle" title="打开弹窗或切换类型时，若已有 key 则自动读取">
-          <input id="autoReadToggle" type="checkbox" checked />
-          <span>打开自动读取</span>
-        </label>
+        <h1 class="title">应用存储读/写</h1>
       </header>
-
-      <section class="route-section is-collapsed" id="routeSection">
-        <button id="routeToggleBtn" class="route-header" type="button" aria-expanded="false">
-          <span class="label">当前路由信息：</span>
-          <span class="route-arrow" aria-hidden="true"></span>
-        </button>
-        <div id="routeInfo" class="route-info">加载中...</div>
-      </section>
 
       <section class="tab-section" id="storageTypeTabs" role="tablist" aria-label="存储类型">
         <button
@@ -87,7 +72,7 @@
             全部 Key
           </button>
         </div>
-        <p id="statusText" class="status" role="status" aria-live="polite"></p>
+        <p id="statusText" class="status status-key" role="status" aria-live="polite"></p>
 
         <div class="history-panel" id="historyPanel" hidden>
           <div class="history-toolbar">
@@ -176,21 +161,21 @@
             <button id="pasteBtn" class="btn btn-ghost" type="button">粘贴</button>
             <button id="copyBtn" class="btn btn-ghost" type="button">复制</button>
             <button id="clearBtn" class="btn btn-ghost" type="button">清空</button>
+            <span class="result-actions-divider" aria-hidden="true"></span>
+            <button id="writeBtn" class="btn btn-success btn-compact" type="button">写入</button>
+            <button id="deleteBtn" class="btn btn-danger btn-compact" type="button">删除</button>
           </div>
         </div>
+        <p id="actionStatusText" class="status status-action" role="status" aria-live="polite"></p>
         <textarea
           id="valueInput"
           class="value-input"
-          placeholder="读取结果会显示在这里；也可粘贴值后点击下方「写入」（Cmd/Ctrl+Enter）"
+          placeholder="读取结果会显示在这里；也可粘贴值后点击右上角「写入」（Cmd/Ctrl+Enter）"
           spellcheck="false"
         ></textarea>
         <div class="value-meta">
           <span id="valueByteMeta" class="value-byte-meta"></span>
           <span id="valueJsonMeta" class="value-json-meta"></span>
-        </div>
-        <div class="write-row">
-          <button id="writeBtn" class="btn btn-success" type="button">写入</button>
-          <button id="deleteBtn" class="btn btn-danger" type="button">删除</button>
         </div>
       </section>
     </div>

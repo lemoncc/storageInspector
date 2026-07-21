@@ -8,7 +8,6 @@ const DEFAULT_STORAGE_TYPE = STORAGE_TYPES.localStorage;
 const LAST_TYPE_STORAGE = 'last-storage-type';
 /** 旧版共用字段，仅用于迁移 */
 const LEGACY_LAST_VALUE_STORAGE = 'last-storage-value';
-const AUTO_READ_SETTING = 'setting-auto-read';
 const HISTORY_LIMIT = 10;
 /** 备选项优先展示的历史条数（按最近使用倒序） */
 const HISTORY_SUGGEST_LIMIT = 3;
@@ -46,10 +45,12 @@ const formatJsonBtn = document.getElementById('formatJsonBtn');
 const compressJsonBtn = document.getElementById('compressJsonBtn');
 const browseKeysBtn = document.getElementById('browseKeysBtn');
 const toggleHistoryBtn = document.getElementById('toggleHistoryBtn');
-const routeSectionEl = document.getElementById('routeSection');
-const routeToggleBtn = document.getElementById('routeToggleBtn');
-const routeInfoEl = document.getElementById('routeInfo');
 const statusTextEl = document.getElementById('statusText');
+const actionStatusTextEl = document.getElementById('actionStatusText');
+const STATUS_ZONE = {
+  key: 'key',
+  action: 'action',
+};
 const storageTypeTabsEl = document.getElementById('storageTypeTabs');
 const historyPanelEl = document.getElementById('historyPanel');
 const historyRowEl = document.getElementById('historyRow');
@@ -62,7 +63,6 @@ const cookieDomainInput = document.getElementById('cookieDomain');
 const cookieSameSiteSelect = document.getElementById('cookieSameSite');
 const cookieSecureCheckbox = document.getElementById('cookieSecure');
 const cookieHttpOnlyCheckbox = document.getElementById('cookieHttpOnly');
-const autoReadToggle = document.getElementById('autoReadToggle');
 const keySuggestListEl = document.getElementById('keySuggestList');
 const keysPanelEl = document.getElementById('keysPanel');
 const keysFilterInput = document.getElementById('keysFilterInput');
@@ -1165,31 +1165,6 @@ async function deleteStorageValue(tab, storageType, key, cookieOptions) {
 }
 
 /**
- * 渲染路由信息
- * @param {{ href?: string, hash?: string, pathname?: string, origin?: string }} routeInfo
- */
-function renderRouteInfo(routeInfo) {
-  if (!routeInfo) {
-    routeInfoEl.textContent = '无法获取当前路由';
-    return;
-  }
-
-  const items = [
-    ['Origin', routeInfo.origin || '-'],
-    ['Path', routeInfo.pathname || '-'],
-    ['Hash', routeInfo.hash || '-'],
-    ['Href', routeInfo.href || '-'],
-  ];
-
-  routeInfoEl.innerHTML = items
-    .map(
-      ([label, value]) =>
-        `<div class="route-item"><span class="route-key">${label}</span><span>${escapeHtml(value)}</span></div>`
-    )
-    .join('');
-}
-
-/**
  * HTML 转义
  * @param {string} text
  * @returns {string}
@@ -1218,30 +1193,49 @@ function truncateText(text, limit = DIFF_PREVIEW_LIMIT) {
 
 /**
  * 设置状态文案
- * @param {string} text
- * @param {'success' | 'error' | 'empty' | ''} type
- */
-/**
- * 设置状态文案（展示在读取按钮下方，便于立即看到结果）
+ * - key：读取行下方（读取 / 历史 / 全部 Key / 导入导出）
+ * - action：值区工具栏下方（写入 / 删除 / 格式化 / 压缩 / 粘贴 / 复制 / 清空）
  * @param {string} text
  * @param {'success' | 'error' | 'empty' | 'pending' | ''} type
+ * @param {'key' | 'action'} [zone]
  */
-function setStatus(text, type = '') {
+function setStatus(text, type = '', zone = STATUS_ZONE.key) {
+  const targetEl = zone === STATUS_ZONE.action ? actionStatusTextEl : statusTextEl;
+  const otherEl = zone === STATUS_ZONE.action ? statusTextEl : actionStatusTextEl;
   const nextType = type || (text ? 'pending' : '');
-  statusTextEl.textContent = text;
-  statusTextEl.className = `status${nextType ? ` is-${nextType}` : ''}`;
+
+  // 同一时刻只突出一个反馈区，避免上下同时闪提示
+  if (text && otherEl) {
+    otherEl.textContent = '';
+    otherEl.className =
+      zone === STATUS_ZONE.action ? 'status status-key' : 'status status-action';
+  }
+
+  targetEl.textContent = text;
+  targetEl.className = `status${zone === STATUS_ZONE.action ? ' status-action' : ' status-key'}${
+    nextType ? ` is-${nextType}` : ''
+  }`;
 
   if (!text) {
     return;
   }
 
   if (nextType === 'error' || nextType === 'empty' || nextType === 'success') {
-    statusTextEl.classList.remove('is-flash');
+    targetEl.classList.remove('is-flash');
     // 触发重绘以重启动画
-    void statusTextEl.offsetWidth;
-    statusTextEl.classList.add('is-flash');
-    statusTextEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    void targetEl.offsetWidth;
+    targetEl.classList.add('is-flash');
+    targetEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
+}
+
+/**
+ * 值区操作反馈（写入 / 删除 / 格式化等）
+ * @param {string} text
+ * @param {'success' | 'error' | 'empty' | 'pending' | ''} type
+ */
+function setActionStatus(text, type = '') {
+  setStatus(text, type, STATUS_ZONE.action);
 }
 
 /**
@@ -1257,14 +1251,6 @@ function getStorageTypeLabel(storageType) {
     return 'cookie';
   }
   return 'localStorage';
-}
-
-/**
- * 是否开启自动读取
- * @returns {boolean}
- */
-function isAutoReadEnabled() {
-  return autoReadToggle.checked;
 }
 
 /**
@@ -1553,14 +1539,6 @@ async function saveLastValue(value) {
 }
 
 /**
- * 切换路由面板折叠状态
- */
-function toggleRouteSection() {
-  const isCollapsed = routeSectionEl.classList.toggle('is-collapsed');
-  routeToggleBtn.setAttribute('aria-expanded', String(!isCollapsed));
-}
-
-/**
  * 获取并校验 key
  * @returns {string | null}
  */
@@ -1608,7 +1586,6 @@ async function refreshPageKeys(renderList = false) {
     pageKeyCache = Array.isArray(pageData.keys) ? pageData.keys : [];
     pageEntriesCache =
       pageData.entries && typeof pageData.entries === 'object' ? pageData.entries : {};
-    renderRouteInfo(pageData);
     if (renderList || !keysPanelEl.hidden) {
       renderKeysList(keysFilterInput.value.trim());
     }
@@ -1899,7 +1876,7 @@ async function switchStorageType(storageType) {
     }
   }
 
-  if (storageKeyInput.value.trim() && isAutoReadEnabled()) {
+  if (storageKeyInput.value.trim()) {
     await handleRead();
   } else {
     const lastValueField = getLastValueField(storageType);
@@ -1907,7 +1884,6 @@ async function switchStorageType(storageType) {
     valueInput.value = typeof stored[lastValueField] === 'string' ? stored[lastValueField] : '';
     autoResizeValueInput();
     updateValueMeta();
-    setStatus(storageKeyInput.value.trim() ? '已关闭自动读取，可手动点击读取' : '请输入 key 后读取', '');
   }
 }
 
@@ -1946,7 +1922,6 @@ async function handleRead() {
     assertInjectableTab(tab);
 
     const pageData = await readStorageValue(tab, currentStorageType, key);
-    renderRouteInfo(pageData);
     await pushKeyHistory(key);
 
     if (pageData.value === null) {
@@ -1996,7 +1971,7 @@ async function handleWrite() {
 
   const value = valueInput.value;
   if (!value) {
-    setStatus('请先粘贴或输入要写入的值', 'error');
+    setActionStatus('请先粘贴或输入要写入的值', 'error');
     valueInput.focus();
     return;
   }
@@ -2014,7 +1989,7 @@ async function handleWrite() {
         danger: true,
       });
       if (!confirmed) {
-        setStatus('已取消写入', 'empty');
+        setActionStatus('已取消写入', 'empty');
         return;
       }
     } else if (existingData.value === null) {
@@ -2024,13 +1999,13 @@ async function handleWrite() {
         okText: '确认写入',
       });
       if (!confirmed) {
-        setStatus('已取消写入', 'empty');
+        setActionStatus('已取消写入', 'empty');
         return;
       }
     }
 
     setBusy(true);
-    setStatus('写入中...');
+    setActionStatus('写入中...');
 
     const cookieOptions =
       currentStorageType === STORAGE_TYPES.cookie ? getCookieWriteOptions() : undefined;
@@ -2041,7 +2016,6 @@ async function handleWrite() {
       value,
       cookieOptions
     );
-    renderRouteInfo(pageData);
     valueInput.value = pageData.value ?? value;
     autoResizeValueInput();
     updateValueMeta();
@@ -2053,7 +2027,7 @@ async function handleWrite() {
         currentStorageType === STORAGE_TYPES.cookie
           ? '写入后回读不一致（可能被浏览器拒绝：Secure/SameSite/Domain/大小限制等）'
           : '写入后回读不一致，请确认页面是否允许写入';
-      setStatus(failTip, 'error');
+      setActionStatus(failTip, 'error');
       return;
     }
 
@@ -2080,7 +2054,7 @@ async function handleWrite() {
       cookieTip = `（${parts.join('，')}）`;
     }
 
-    setStatus(
+    setActionStatus(
       `写入成功：${getStorageTypeLabel(currentStorageType)} / ${key}（长度 ${value.length}）${cookieTip}`,
       'success'
     );
@@ -2091,7 +2065,7 @@ async function handleWrite() {
       refreshPageKeys(false).catch(() => {});
     }
   } catch (error) {
-    setStatus(error instanceof Error ? error.message : '写入失败', 'error');
+    setActionStatus(error instanceof Error ? error.message : '写入失败', 'error');
   } finally {
     setBusy(false);
   }
@@ -2137,12 +2111,12 @@ async function handleDelete() {
       danger: true,
     });
     if (!confirmed) {
-      setStatus('已取消删除', 'empty');
+      setActionStatus('已取消删除', 'empty');
       return;
     }
 
     setBusy(true);
-    setStatus('删除中...');
+    setActionStatus('删除中...');
 
     const writeOptions =
       currentStorageType === STORAGE_TYPES.cookie ? getCookieWriteOptions() : null;
@@ -2150,14 +2124,13 @@ async function handleDelete() {
       ? { path: writeOptions.path, domain: writeOptions.domain }
       : undefined;
     const pageData = await deleteStorageValue(tab, currentStorageType, key, cookieOptions);
-    renderRouteInfo(pageData);
 
     if (!pageData.success) {
       const failTip =
         currentStorageType === STORAGE_TYPES.cookie
           ? '删除失败：cookie 仍存在。可尝试修改 Path/Domain 后再删'
           : '删除失败：key 仍存在';
-      setStatus(failTip, 'error');
+      setActionStatus(failTip, 'error');
       return;
     }
 
@@ -2166,7 +2139,7 @@ async function handleDelete() {
     updateValueMeta();
     await pushKeyHistory(key);
     await saveLastValue('');
-    setStatus(`已删除：${typeLabel} / ${key}`, 'success');
+    setActionStatus(`已删除：${typeLabel} / ${key}`, 'success');
 
     if (!keysPanelEl.hidden) {
       refreshPageKeys(true).catch(() => {});
@@ -2174,7 +2147,7 @@ async function handleDelete() {
       refreshPageKeys(false).catch(() => {});
     }
   } catch (error) {
-    setStatus(error instanceof Error ? error.message : '删除失败', 'error');
+    setActionStatus(error instanceof Error ? error.message : '删除失败', 'error');
   } finally {
     setBusy(false);
   }
@@ -2294,7 +2267,6 @@ async function handleImportFile(file) {
         cookieOptions ?? null,
       ]);
     }
-    renderRouteInfo(result);
     await refreshPageKeys(true);
 
     if (result.failCount > 0) {
@@ -2316,16 +2288,16 @@ async function handleImportFile(file) {
 async function handleCopy() {
   const text = valueInput.value;
   if (!text) {
-    setStatus('没有可复制的内容', 'empty');
+    setActionStatus('没有可复制的内容', 'empty');
     return;
   }
 
   try {
     await navigator.clipboard.writeText(text);
     await saveLastValue(text);
-    setStatus('已复制到剪贴板', 'success');
+    setActionStatus('已复制到剪贴板', 'success');
   } catch {
-    setStatus('复制失败，请手动选中复制', 'error');
+    setActionStatus('复制失败，请手动选中复制', 'error');
   }
 }
 
@@ -2336,17 +2308,17 @@ async function handlePaste() {
   try {
     const text = await navigator.clipboard.readText();
     if (!text) {
-      setStatus('剪贴板为空', 'empty');
+      setActionStatus('剪贴板为空', 'empty');
       return;
     }
     valueInput.value = text;
     autoResizeValueInput();
     updateValueMeta();
     clearNestedStringRestoreMap();
-    setStatus(`已粘贴，长度 ${text.length}，可点击「写入」`, 'success');
+    setActionStatus(`已粘贴，长度 ${text.length}，可点击右上角「写入」`, 'success');
     valueInput.focus();
   } catch {
-    setStatus('粘贴失败，请手动 Ctrl/Cmd + V 粘贴到输入框', 'error');
+    setActionStatus('粘贴失败，请手动 Ctrl/Cmd + V 粘贴到输入框', 'error');
     valueInput.focus();
   }
 }
@@ -2676,7 +2648,7 @@ function deepRestoreJsonValue(value, counter, path = '', depth = 0) {
 function handleFormatJson() {
   const text = valueInput.value.trim();
   if (!text) {
-    setStatus('没有可格式化的内容', 'empty');
+    setActionStatus('没有可格式化的内容', 'empty');
     return;
   }
 
@@ -2690,15 +2662,15 @@ function handleFormatJson() {
     autoResizeValueInput();
     updateValueMeta();
     if (counter.expandedCount > 0) {
-      setStatus(
+      setActionStatus(
         `已递归格式化（解析 ${counter.expandedCount} 处嵌套对象；压缩时按原文还原，可安全写入）`,
         'success'
       );
     } else {
-      setStatus('已格式化 JSON', 'success');
+      setActionStatus('已格式化 JSON', 'success');
     }
   } catch {
-    setStatus('不是合法 JSON，无法格式化', 'error');
+    setActionStatus('不是合法 JSON，无法格式化', 'error');
   }
 }
 
@@ -2708,7 +2680,7 @@ function handleFormatJson() {
 function handleCompressJson() {
   const text = valueInput.value.trim();
   if (!text) {
-    setStatus('没有可压缩的内容', 'empty');
+    setActionStatus('没有可压缩的内容', 'empty');
     return;
   }
 
@@ -2722,12 +2694,12 @@ function handleCompressJson() {
     updateValueMeta();
     clearNestedStringRestoreMap();
     if (counter.restoredCount > 0) {
-      setStatus(`已压缩并还原 ${counter.restoredCount} 处嵌套字符串，可安全写入`, 'success');
+      setActionStatus(`已压缩并还原 ${counter.restoredCount} 处嵌套字符串，可安全写入`, 'success');
     } else {
-      setStatus('已压缩 JSON', 'success');
+      setActionStatus('已压缩 JSON', 'success');
     }
   } catch {
-    setStatus('不是合法 JSON，无法压缩', 'error');
+    setActionStatus('不是合法 JSON，无法压缩', 'error');
   }
 }
 
@@ -2759,7 +2731,7 @@ function handleClear() {
   autoResizeValueInput();
   updateValueMeta();
   clearNestedStringRestoreMap();
-  setStatus('已清空', '');
+  setActionStatus('已清空', '');
   valueInput.focus();
 }
 
@@ -2816,13 +2788,10 @@ async function initPopup() {
   const stored = await chrome.storage.local.get([
     LAST_TYPE_STORAGE,
     LEGACY_LAST_VALUE_STORAGE,
-    AUTO_READ_SETTING,
     ...historyFields,
     ...lastKeyFields,
     ...lastValueFields,
   ]);
-
-  autoReadToggle.checked = stored[AUTO_READ_SETTING] !== false;
 
   const savedType = stored[LAST_TYPE_STORAGE];
   currentStorageType = Object.values(STORAGE_TYPES).includes(savedType) ? savedType : DEFAULT_STORAGE_TYPE;
@@ -2942,7 +2911,6 @@ async function initPopup() {
     }
   });
 
-  routeToggleBtn.addEventListener('click', toggleRouteSection);
   readBtn.addEventListener('click', handleRead);
   writeBtn.addEventListener('click', handleWrite);
   deleteBtn.addEventListener('click', handleDelete);
@@ -2955,11 +2923,6 @@ async function initPopup() {
   valueInput.addEventListener('input', () => {
     autoResizeValueInput();
     updateValueMeta();
-  });
-
-  autoReadToggle.addEventListener('change', () => {
-    chrome.storage.local.set({ [AUTO_READ_SETTING]: autoReadToggle.checked });
-    setStatus(autoReadToggle.checked ? '已开启打开自动读取' : '已关闭打开自动读取', 'success');
   });
 
   cookieSameSiteSelect.addEventListener('change', () => {
@@ -3067,10 +3030,9 @@ async function initPopup() {
   syncKeysPanelButton();
   syncHistoryPanelVisibility();
 
-  if (storageKeyInput.value.trim() && isAutoReadEnabled()) {
+  // 打开弹窗时自动读取当前 key；失败由 handleRead 展示错误
+  if (storageKeyInput.value.trim()) {
     await handleRead();
-  } else if (storageKeyInput.value.trim()) {
-    setStatus('已关闭自动读取，可手动点击读取', '');
   }
 }
 
