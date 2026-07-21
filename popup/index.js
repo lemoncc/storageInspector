@@ -99,7 +99,7 @@ let cookieDetailCache = {};
  * @type {number | null}
  */
 let cookiePreservedExpirationDate = null;
-/** @type {Array<{ key: string, source: string }>} */
+/** @type {Array<{ key: string, source: string, label?: string, cacheKey?: string }>} */
 let suggestItems = [];
 let suggestActiveIndex = -1;
 let suggestBlurTimer = null;
@@ -632,6 +632,85 @@ function mapSameSiteFromApi(sameSite) {
 }
 
 /**
+ * 生成 cookie 缓存键（同名不同 Path/Domain 互不覆盖）
+ * @param {{ name?: string, path?: string, domain?: string, hostOnly?: boolean }} cookie
+ * @returns {string}
+ */
+function buildCookieCacheKey(cookie) {
+  const name = cookie.name || '';
+  const path = cookie.path || '/';
+  const domainPart = cookie.hostOnly ? '' : String(cookie.domain || '');
+  return `${name}\u0001${path}\u0001${domainPart}`;
+}
+
+/**
+ * 导出用 cookie 序列化
+ * @param {chrome.cookies.Cookie} cookie
+ * @returns {Record<string, any>}
+ */
+function serializeCookieForExport(cookie) {
+  return {
+    name: cookie.name,
+    value: cookie.value,
+    path: cookie.path || '/',
+    domain: cookie.hostOnly ? '' : cookie.domain || '',
+    hostOnly: Boolean(cookie.hostOnly),
+    secure: Boolean(cookie.secure),
+    httpOnly: Boolean(cookie.httpOnly),
+    sameSite: cookie.sameSite || '',
+    session: Boolean(cookie.session),
+    expirationDate:
+      cookie.session || !cookie.expirationDate ? null : cookie.expirationDate,
+  };
+}
+
+/**
+ * 规范化导入的 cookie 详情条目
+ * @param {any} item
+ * @returns {{ name: string, value: string, path: string, domain: string, secure: boolean, httpOnly: boolean, sameSite: string, maxAge: null, expirationDate: number | null } | null}
+ */
+function normalizeImportedCookieItem(item) {
+  if (!item || typeof item !== 'object') {
+    return null;
+  }
+  const name = typeof item.name === 'string' ? item.name.trim() : '';
+  if (!name) {
+    return null;
+  }
+  const value = item.value == null ? '' : String(item.value);
+  const path = typeof item.path === 'string' && item.path.trim() ? item.path.trim() : '/';
+  const hostOnly = Boolean(item.hostOnly);
+  const domain = hostOnly
+    ? ''
+    : typeof item.domain === 'string'
+      ? item.domain.trim()
+      : '';
+  const sameSiteRaw = typeof item.sameSite === 'string' ? item.sameSite : '';
+  // 兼容 API 小写与表单大写
+  const sameSite =
+    sameSiteRaw === 'lax' || sameSiteRaw === 'strict' || sameSiteRaw === 'no_restriction'
+      ? mapSameSiteFromApi(sameSiteRaw)
+      : sameSiteRaw;
+  const expirationDate =
+    typeof item.expirationDate === 'number' && Number.isFinite(item.expirationDate)
+      ? item.expirationDate
+      : null;
+  const session = item.session === true || expirationDate === null;
+
+  return {
+    name,
+    value,
+    path,
+    domain,
+    secure: Boolean(item.secure),
+    httpOnly: Boolean(item.httpOnly),
+    sameSite,
+    maxAge: null,
+    expirationDate: session ? null : expirationDate,
+  };
+}
+
+/**
  * 根据 cookie 详情构造可用于 remove/set 的 URL
  * @param {chrome.cookies.Cookie} cookie
  * @param {chrome.tabs.Tab} tab
@@ -942,7 +1021,7 @@ async function readCookieViaApi(tab, key) {
     return { ...routeInfo, value: null, cookie: null, httpOnly: false };
   }
 
-  cookieDetailCache[key] = cookie;
+  cookieDetailCache[buildCookieCacheKey(cookie)] = cookie;
   applyCookieDetailsToForm(cookie);
   return {
     ...routeInfo,
@@ -953,7 +1032,7 @@ async function readCookieViaApi(tab, key) {
 }
 
 /**
- * 通过 chrome.cookies 列出当前页可见 cookie（含 HttpOnly）
+ * 通过 chrome.cookies 列出当前页可见 cookie（含 HttpOnly；同名多 Path 全部保留）
  * @param {chrome.tabs.Tab} tab
  */
 async function listCookiesViaApi(tab) {
@@ -965,13 +1044,6 @@ async function listCookiesViaApi(tab) {
       return '';
     }
   })();
-  const pathname = (() => {
-    try {
-      return new URL(tab.url || '').pathname || '/';
-    } catch {
-      return '/';
-    }
-  })();
 
   const cookies = (await collectTabCookies(tab)).filter((cookie) =>
     isCookieMatchHostname(cookie, hostname)
@@ -981,32 +1053,34 @@ async function listCookiesViaApi(tab) {
   const entries = {};
   /** @type {Record<string, chrome.cookies.Cookie>} */
   const details = {};
-  /** @type {Map<string, chrome.cookies.Cookie[]>} */
-  const groupedByName = new Map();
 
   cookies.forEach((cookie) => {
-    const list = groupedByName.get(cookie.name) || [];
-    list.push(cookie);
-    groupedByName.set(cookie.name, list);
-  });
-
-  groupedByName.forEach((list, name) => {
-    const preferred = pickPreferredCookie(list, pathname);
-    if (!preferred) {
-      return;
-    }
-    entries[name] = preferred.value;
-    details[name] = preferred;
+    const cacheKey = buildCookieCacheKey(cookie);
+    entries[cacheKey] = cookie.value;
+    details[cacheKey] = cookie;
   });
 
   cookieDetailCache = details;
-  const keys = Object.keys(entries).sort((left, right) => left.localeCompare(right));
-  const httpOnlyCount = keys.filter((name) => details[name]?.httpOnly).length;
+  const keys = Object.keys(details).sort((leftKey, rightKey) => {
+    const left = details[leftKey];
+    const right = details[rightKey];
+    const nameCmp = left.name.localeCompare(right.name);
+    if (nameCmp !== 0) {
+      return nameCmp;
+    }
+    const pathCmp = (left.path || '/').localeCompare(right.path || '/');
+    if (pathCmp !== 0) {
+      return pathCmp;
+    }
+    return String(left.domain || '').localeCompare(String(right.domain || ''));
+  });
+  const httpOnlyCount = keys.filter((cacheKey) => details[cacheKey]?.httpOnly).length;
   return {
     ...routeInfo,
     keys,
     entries,
     cookieDetails: details,
+    cookies: keys.map((cacheKey) => serializeCookieForExport(details[cacheKey])),
     httpOnlyCount,
     totalCount: keys.length,
   };
@@ -1018,8 +1092,9 @@ async function listCookiesViaApi(tab) {
  * @param {string} key
  * @param {string} value
  * @param {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string, httpOnly: boolean, expirationDate?: number | null }} options
+ * @param {'replace-all-same-name' | 'upsert-identity'} [conflictMode]
  */
-async function writeCookieViaApi(tab, key, value, options) {
+async function writeCookieViaApi(tab, key, value, options, conflictMode = 'replace-all-same-name') {
   const routeInfo = buildRouteInfoFromTab(tab);
   await ensureCookieHostPermission(tab.url || '');
   const storeId = tab.id ? await getTabCookieStoreId(tab.id) : undefined;
@@ -1033,14 +1108,24 @@ async function writeCookieViaApi(tab, key, value, options) {
     cookieSecureCheckbox.checked = true;
   }
 
-  // 写入前删除同名旧 cookie，避免改 Path/Domain 后旧条目残留
+  const nextPath = options.path || '/';
+  const nextDomainNorm = (options.domain || '').replace(/^\./, '');
+
+  // 写入前清理冲突项：
+  // - replace-all-same-name：删掉同名全部（表单单条写入，避免改 Path 残留）
+  // - upsert-identity：只删同 identity（导入多 Path 同名时互不影响）
   const existingCookies = (await collectTabCookies(tab)).filter((cookie) => cookie.name === key);
   for (const cookie of existingCookies) {
-    await chrome.cookies.remove({
-      url: buildCookieUrl(cookie, tab),
-      name: key,
-      storeId: cookie.storeId,
-    });
+    const oldPath = cookie.path || '/';
+    const oldDomainNorm = cookie.hostOnly ? '' : String(cookie.domain || '').replace(/^\./, '');
+    const isSameIdentity = oldPath === nextPath && oldDomainNorm === nextDomainNorm;
+    if (conflictMode === 'replace-all-same-name' || isSameIdentity) {
+      await chrome.cookies.remove({
+        url: buildCookieUrl(cookie, tab),
+        name: key,
+        storeId: cookie.storeId,
+      });
+    }
   }
 
   /** @type {chrome.cookies.SetDetails} */
@@ -1048,7 +1133,7 @@ async function writeCookieViaApi(tab, key, value, options) {
     url: normalizeCookieQueryUrl(tab.url || ''),
     name: key,
     value,
-    path: options.path || '/',
+    path: nextPath,
     secure,
     httpOnly,
   };
@@ -1078,7 +1163,7 @@ async function writeCookieViaApi(tab, key, value, options) {
     return { ...routeInfo, value: null, success: false, httpOnly };
   }
 
-  cookieDetailCache[key] = result;
+  cookieDetailCache[buildCookieCacheKey(result)] = result;
   applyCookieDetailsToForm(result);
   return {
     ...routeInfo,
@@ -1151,13 +1236,17 @@ async function deleteCookieViaApi(tab, key, options = {}) {
 
   const remainFinal = (await collectTabCookies(tab)).filter((cookie) => cookie.name === key);
   if (!remainFinal.length) {
-    delete cookieDetailCache[key];
+    Object.keys(cookieDetailCache).forEach((cacheKey) => {
+      if (cookieDetailCache[cacheKey]?.name === key) {
+        delete cookieDetailCache[cacheKey];
+      }
+    });
   }
   return { ...routeInfo, success: remainFinal.length === 0 };
 }
 
 /**
- * 批量通过 chrome.cookies 写入
+ * 批量通过 chrome.cookies 写入（共用同一套表单选项，兼容旧导入）
  * @param {chrome.tabs.Tab} tab
  * @param {Record<string, string>} entries
  * @param {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string, httpOnly: boolean, expirationDate?: number | null }} options
@@ -1183,6 +1272,47 @@ async function writeCookiesBatchViaApi(tab, entries, options) {
   }
 
   return { ...routeInfo, successCount, failCount, total: entryList.length };
+}
+
+/**
+ * 按每条 cookie 自身属性批量写入（用于带详情的导入）
+ * @param {chrome.tabs.Tab} tab
+ * @param {Array<ReturnType<typeof normalizeImportedCookieItem>>} cookieItems
+ */
+async function writeCookiesDetailedBatchViaApi(tab, cookieItems) {
+  const routeInfo = buildRouteInfoFromTab(tab);
+  let successCount = 0;
+  let failCount = 0;
+  const list = (cookieItems || []).filter(Boolean);
+
+  for (const item of list) {
+    try {
+      const result = await writeCookieViaApi(
+        tab,
+        item.name,
+        item.value,
+        {
+          path: item.path,
+          domain: item.domain,
+          secure: item.secure,
+          httpOnly: item.httpOnly,
+          sameSite: item.sameSite,
+          maxAge: item.maxAge,
+          expirationDate: item.expirationDate,
+        },
+        'upsert-identity'
+      );
+      if (result.success) {
+        successCount += 1;
+      } else {
+        failCount += 1;
+      }
+    } catch {
+      failCount += 1;
+    }
+  }
+
+  return { ...routeInfo, successCount, failCount, total: list.length };
 }
 
 /**
@@ -1681,7 +1811,23 @@ async function refreshPageKeys(renderList = false) {
  */
 function renderKeysList(filterText = '') {
   const keyword = filterText.trim().toLowerCase();
-  const filteredKeys = pageKeyCache.filter((key) => !keyword || key.toLowerCase().includes(keyword));
+  const filteredKeys = pageKeyCache.filter((key) => {
+    if (!keyword) {
+      return true;
+    }
+    if (currentStorageType === STORAGE_TYPES.cookie) {
+      const detail = cookieDetailCache[key];
+      const name = detail?.name || key;
+      const path = detail?.path || '/';
+      const domain = detail?.domain || '';
+      return (
+        name.toLowerCase().includes(keyword) ||
+        path.toLowerCase().includes(keyword) ||
+        domain.toLowerCase().includes(keyword)
+      );
+    }
+    return key.toLowerCase().includes(keyword);
+  });
 
   if (!filteredKeys.length) {
     keysListEl.innerHTML = '';
@@ -1694,22 +1840,44 @@ function renderKeysList(filterText = '') {
   keysListEl.innerHTML = filteredKeys
     .map((key) => {
       const encodedKey = encodeURIComponent(key);
-      const safeLabel = escapeHtml(key);
       const detail = cookieDetailCache[key];
+      const displayName =
+        currentStorageType === STORAGE_TYPES.cookie && detail ? detail.name : key;
+      const safeLabel = escapeHtml(displayName);
       const badges = [];
-      if (detail?.path && detail.path !== '/') {
+      if (currentStorageType === STORAGE_TYPES.cookie && detail) {
+        // 同名多 Path 时 Path 始终展示，便于区分
+        badges.push(
+          `<span class="keys-badge is-path" title="Path">${escapeHtml(detail.path || '/')}</span>`
+        );
+        if (detail.domain && !detail.hostOnly) {
+          badges.push(
+            `<span class="keys-badge is-domain" title="Domain">${escapeHtml(detail.domain)}</span>`
+          );
+        }
+        if (detail.httpOnly) {
+          badges.push('<span class="keys-badge is-httponly">HttpOnly</span>');
+        }
+        if (detail.secure) {
+          badges.push('<span class="keys-badge is-secure">Secure</span>');
+        }
+      } else if (detail?.path && detail.path !== '/') {
         badges.push(`<span class="keys-badge is-path" title="Path">${escapeHtml(detail.path)}</span>`);
-      }
-      if (detail?.httpOnly) {
-        badges.push('<span class="keys-badge is-httponly">HttpOnly</span>');
-      }
-      if (detail?.secure) {
-        badges.push('<span class="keys-badge is-secure">Secure</span>');
+        if (detail?.httpOnly) {
+          badges.push('<span class="keys-badge is-httponly">HttpOnly</span>');
+        }
+        if (detail?.secure) {
+          badges.push('<span class="keys-badge is-secure">Secure</span>');
+        }
       }
       const badgeHtml = badges.length
         ? `<span class="keys-item-badges">${badges.join('')}</span>`
         : '';
-      return `<button class="keys-item" type="button" data-key="${encodedKey}" title="${safeLabel}">
+      const titleText =
+        currentStorageType === STORAGE_TYPES.cookie && detail
+          ? `${detail.name} | path=${detail.path || '/'}${detail.domain ? ` | domain=${detail.domain}` : ''}`
+          : displayName;
+      return `<button class="keys-item" type="button" data-key="${encodedKey}" title="${escapeHtml(titleText)}">
           <span class="keys-item-name">${safeLabel}</span>${badgeHtml}
         </button>`;
     })
@@ -1775,7 +1943,7 @@ function getHistorySuggestKeys(keyword) {
 /**
  * 仅用历史记录构建备选项（先展示，再异步补全页面 Key）
  * @param {string} query
- * @returns {Array<{ key: string, source: string }>}
+ * @returns {Array<{ key: string, source: string, label?: string, cacheKey?: string }>}
  */
 function buildHistorySuggestItems(query) {
   return getHistorySuggestKeys(query).map((key) => ({
@@ -1787,28 +1955,56 @@ function buildHistorySuggestItems(query) {
 /**
  * 合并联想候选：先历史倒序 3 条，再追加全部页面 Key（去重）
  * @param {string} query
- * @returns {Array<{ key: string, source: string }>}
+ * @returns {Array<{ key: string, source: string, label?: string, cacheKey?: string }>}
  */
 function buildSuggestItems(query) {
   const keyword = query.trim().toLowerCase();
-  /** @type {Array<{ key: string, source: string }>} */
+  /** @type {Array<{ key: string, source: string, label?: string, cacheKey?: string }>} */
   const items = [];
   const seenKeys = new Set();
 
   getHistorySuggestKeys(query).forEach((key) => {
     items.push({ key, source: '历史记录' });
-    seenKeys.add(key);
+    seenKeys.add(`name:${key}`);
   });
 
-  pageKeyCache.forEach((key) => {
-    if (seenKeys.has(key)) {
+  pageKeyCache.forEach((cacheKey) => {
+    if (currentStorageType === STORAGE_TYPES.cookie) {
+      const detail = cookieDetailCache[cacheKey];
+      if (!detail) {
+        return;
+      }
+      const path = detail.path || '/';
+      const label = `${detail.name} (${path})`;
+      const dedupeId = `cookie:${cacheKey}`;
+      if (seenKeys.has(dedupeId)) {
+        return;
+      }
+      if (
+        keyword &&
+        !detail.name.toLowerCase().includes(keyword) &&
+        !path.toLowerCase().includes(keyword)
+      ) {
+        return;
+      }
+      items.push({
+        key: detail.name,
+        label,
+        cacheKey,
+        source: '页面',
+      });
+      seenKeys.add(dedupeId);
       return;
     }
-    if (keyword && !key.toLowerCase().includes(keyword)) {
+
+    if (seenKeys.has(`name:${cacheKey}`)) {
       return;
     }
-    items.push({ key, source: '页面' });
-    seenKeys.add(key);
+    if (keyword && !cacheKey.toLowerCase().includes(keyword)) {
+      return;
+    }
+    items.push({ key: cacheKey, source: '页面' });
+    seenKeys.add(`name:${cacheKey}`);
   });
 
   return items;
@@ -1854,8 +2050,9 @@ function renderKeySuggest(options = {}) {
   keySuggestListEl.innerHTML = suggestItems
     .map((item, index) => {
       const activeClass = index === suggestActiveIndex ? ' is-active' : '';
+      const label = item.label || item.key;
       return `<li class="key-suggest-item${activeClass}" role="option" data-index="${index}">
-        <span>${escapeHtml(item.key)}</span>
+        <span>${escapeHtml(label)}</span>
         <span class="key-suggest-source">${escapeHtml(item.source)}</span>
       </li>`;
     })
@@ -1940,6 +2137,10 @@ async function selectSuggestItem(index) {
     return;
   }
   hideKeySuggest();
+  if (item.cacheKey && cookieDetailCache[item.cacheKey]) {
+    await handleSelectCookieListKey(item.cacheKey);
+    return;
+  }
   storageKeyInput.value = item.key;
   syncClearKeyButton();
   await handleRead();
@@ -2005,6 +2206,49 @@ async function handleSelectHistoryKey(key) {
   storageKeyInput.value = key;
   syncClearKeyButton();
   await handleRead();
+}
+
+/**
+ * 从全部 Key 列表点选某条 cookie（按 Path/Domain 精确回填并读取）
+ * @param {string} cacheKey
+ */
+async function handleSelectCookieListKey(cacheKey) {
+  if (isBusy) {
+    return;
+  }
+
+  const cookie = cookieDetailCache[cacheKey];
+  if (!cookie) {
+    setStatus('未找到该 cookie 详情，请刷新后重试', 'error');
+    return;
+  }
+
+  hideKeySuggest();
+  storageKeyInput.value = cookie.name;
+  syncClearKeyButton();
+  applyCookieDetailsToForm(cookie);
+
+  setBusy(true);
+  setStatus('读取中...');
+  try {
+    valueInput.value = cookie.value ?? '';
+    autoResizeValueInput();
+    updateValueMeta();
+    clearNestedStringRestoreMap();
+    await pushKeyHistory(cookie.name);
+    await saveLastValue(cookie.value ?? '');
+    const byteLength = new TextEncoder().encode(cookie.value ?? '').length;
+    const httpOnlyTip = cookie.httpOnly ? ' · HttpOnly' : '';
+    const pathTip = ` · path=${cookie.path || '/'}`;
+    setStatus(
+      `读取成功（cookie${httpOnlyTip}${pathTip}），${(cookie.value || '').length} 字符 · ${byteLength} 字节`,
+      'success'
+    );
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : '读取失败', 'error');
+  } finally {
+    setBusy(false);
+  }
 }
 
 /**
@@ -2368,12 +2612,34 @@ async function handleExport() {
 
   try {
     const pageData = await refreshPageKeys(true);
+    /** @type {Record<string, any>} */
     const payload = {
       type: currentStorageType,
+      version: 2,
       exportedAt: new Date().toISOString(),
       origin: pageData.origin || '',
       data: pageData.entries || {},
     };
+
+    if (currentStorageType === STORAGE_TYPES.cookie) {
+      const cookieList = Array.isArray(pageData.cookies)
+        ? pageData.cookies
+        : Object.values(cookieDetailCache).map((cookie) => serializeCookieForExport(cookie));
+      payload.cookies = cookieList;
+      // 兼容旧导入：data 仍提供 name -> value（同名多 Path 时保留列表中第一条）
+      /** @type {Record<string, string>} */
+      const compatData = {};
+      cookieList.forEach((item) => {
+        if (item?.name && compatData[item.name] === undefined) {
+          compatData[item.name] = item.value == null ? '' : String(item.value);
+        }
+      });
+      payload.data = compatData;
+      setStatus(`已导出 ${cookieList.length} 个 cookie（含 Path/HttpOnly 等详情）`, 'success');
+    } else {
+      setStatus(`已导出 ${Object.keys(payload.data).length} 个 key`, 'success');
+    }
+
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const objectUrl = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
@@ -2381,7 +2647,6 @@ async function handleExport() {
     anchor.download = `${currentStorageType}-${Date.now()}.json`;
     anchor.click();
     URL.revokeObjectURL(objectUrl);
-    setStatus(`已导出 ${Object.keys(payload.data).length} 个 key`, 'success');
   } catch (error) {
     setStatus(error instanceof Error ? error.message : '导出失败', 'error');
   } finally {
@@ -2392,18 +2657,31 @@ async function handleExport() {
 /**
  * 解析导入 JSON
  * @param {string} text
- * @returns {Record<string, string>}
+ * @returns {{ mode: 'cookieDetails', cookies: Array<NonNullable<ReturnType<typeof normalizeImportedCookieItem>>>, type?: string } | { mode: 'entries', entries: Record<string, string>, type?: string }}
  */
-function parseImportEntries(text) {
+function parseImportPayload(text) {
   const parsed = JSON.parse(text);
-  let rawEntries = parsed;
+  const payloadType = parsed && typeof parsed === 'object' ? parsed.type : undefined;
 
+  if (parsed && typeof parsed === 'object' && Array.isArray(parsed.cookies) && parsed.cookies.length) {
+    const cookies = parsed.cookies
+      .map((item) => normalizeImportedCookieItem(item))
+      .filter(Boolean);
+    if (!cookies.length) {
+      throw new Error('导入 cookies 详情为空或格式无效');
+    }
+    return { mode: 'cookieDetails', cookies, type: payloadType };
+  }
+
+  let rawEntries = parsed;
   if (parsed && typeof parsed === 'object' && parsed.data && typeof parsed.data === 'object') {
     rawEntries = parsed.data;
   }
 
   if (!rawEntries || typeof rawEntries !== 'object' || Array.isArray(rawEntries)) {
-    throw new Error('导入格式无效，需要 { key: value } 或 { data: { key: value } }');
+    throw new Error(
+      '导入格式无效，需要 { key: value }、{ data: { key: value } } 或 { cookies: [...] }'
+    );
   }
 
   /** @type {Record<string, string>} */
@@ -2418,7 +2696,7 @@ function parseImportEntries(text) {
     throw new Error('导入内容为空');
   }
 
-  return entries;
+  return { mode: 'entries', entries, type: payloadType };
 }
 
 /**
@@ -2432,17 +2710,41 @@ async function handleImportFile(file) {
 
   try {
     const text = await file.text();
-    const entries = parseImportEntries(text);
-    const keys = Object.keys(entries);
-    const preview = keys
-      .slice(0, 8)
-      .map((key) => `- ${key}`)
-      .join('\n');
-    const moreTip = keys.length > 8 ? `\n…共 ${keys.length} 个 key` : '';
+    const payload = parseImportPayload(text);
+
+    if (payload.type && payload.type !== currentStorageType) {
+      const confirmedType = await showConfirmDialog({
+        title: '导入类型不一致',
+        body: `文件类型是「${payload.type}」，当前是「${currentStorageType}」。仍要导入到当前类型吗？`,
+        okText: '继续导入',
+        danger: true,
+      });
+      if (!confirmedType) {
+        setStatus('已取消导入', 'empty');
+        return;
+      }
+    }
+
+    let preview = '';
+    let totalCount = 0;
+    if (payload.mode === 'cookieDetails') {
+      totalCount = payload.cookies.length;
+      preview = payload.cookies
+        .slice(0, 8)
+        .map((item) => `- ${item.name} (path=${item.path}${item.httpOnly ? ', HttpOnly' : ''})`)
+        .join('\n');
+    } else {
+      totalCount = Object.keys(payload.entries).length;
+      preview = Object.keys(payload.entries)
+        .slice(0, 8)
+        .map((key) => `- ${key}`)
+        .join('\n');
+    }
+    const moreTip = totalCount > 8 ? `\n…共 ${totalCount} 条` : '';
 
     const confirmed = await showConfirmDialog({
       title: `确认导入到 ${getStorageTypeLabel(currentStorageType)}？`,
-      body: `将写入 / 覆盖以下 key：\n${preview}${moreTip}`,
+      body: `将写入 / 覆盖以下条目：\n${preview}${moreTip}`,
       okText: '确认导入',
       danger: true,
     });
@@ -2456,25 +2758,29 @@ async function handleImportFile(file) {
 
     const tab = await getActiveTab();
     assertInjectableTab(tab);
-    const cookieOptions =
-      currentStorageType === STORAGE_TYPES.cookie ? getCookieWriteOptions() : undefined;
 
     let result;
-    if (currentStorageType === STORAGE_TYPES.cookie) {
-      result = await writeCookiesBatchViaApi(tab, entries, cookieOptions);
-    } else {
+    if (currentStorageType === STORAGE_TYPES.cookie && payload.mode === 'cookieDetails') {
+      result = await writeCookiesDetailedBatchViaApi(tab, payload.cookies);
+    } else if (currentStorageType === STORAGE_TYPES.cookie) {
+      const cookieOptions = getCookieWriteOptions();
+      result = await writeCookiesBatchViaApi(tab, payload.entries, cookieOptions);
+    } else if (payload.mode === 'entries') {
       result = await executeInTab(tab.id, writePageStorageBatch, [
         currentStorageType,
-        entries,
-        cookieOptions ?? null,
+        payload.entries,
+        null,
       ]);
+    } else {
+      throw new Error('当前类型不支持 cookies 详情导入，请切换到 cookie');
     }
+
     await refreshPageKeys(true);
 
     if (result.failCount > 0) {
       setStatus(`导入完成：成功 ${result.successCount}，失败 ${result.failCount}`, 'error');
     } else {
-      setStatus(`导入成功：${result.successCount} 个 key`, 'success');
+      setStatus(`导入成功：${result.successCount} 条`, 'success');
     }
   } catch (error) {
     setStatus(error instanceof Error ? error.message : '导入失败', 'error');
@@ -3166,9 +3472,18 @@ async function initPopup() {
       return;
     }
     try {
-      handleSelectHistoryKey(decodeURIComponent(item.dataset.key));
+      const decodedKey = decodeURIComponent(item.dataset.key);
+      if (currentStorageType === STORAGE_TYPES.cookie) {
+        handleSelectCookieListKey(decodedKey);
+      } else {
+        handleSelectHistoryKey(decodedKey);
+      }
     } catch {
-      handleSelectHistoryKey(item.dataset.key);
+      if (currentStorageType === STORAGE_TYPES.cookie) {
+        handleSelectCookieListKey(item.dataset.key);
+      } else {
+        handleSelectHistoryKey(item.dataset.key);
+      }
     }
   });
 
