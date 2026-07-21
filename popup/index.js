@@ -117,17 +117,21 @@ const SUGGEST_DEBOUNCE_MS = 220;
 const PAGE_KEYS_CACHE_TTL_MS = 30000;
 
 /**
- * 递归格式化还原表：路径 -> 展开前原始字符串
- * @type {Map<string, string>}
+ * 递归格式化还原表：路径 -> { prefix, suffix, original }
+ * - 未编辑：压缩/写入用 original，保留函数等原文
+ * - 已编辑：用当前对象 JSON.stringify 后拼 prefix/suffix，保留内层修改
+ * @type {Map<string, { prefix: string, suffix: string, original: string }>}
  */
 let nestedStringRestoreMap = new Map();
 /** 是否处于「已递归展开、尚未还原」状态 */
 let formatExpandActive = false;
-/** 格式化前的整段原文（还原表异常时的保底，避免把展开态写入） */
+/** 格式化展开后是否被用户改过（改过则按当前内容重序列化，不再回退整段原文） */
+let formatExpandDirty = false;
+/** 格式化前的整段原文（未编辑且还原失败时的保底） */
 let preFormatRootText = '';
 /**
- * 格式化时的还原表备份（防止写入前还原表被意外清空）
- * @type {Map<string, string> | null}
+ * 格式化时的还原表备份
+ * @type {Map<string, { prefix: string, suffix: string, original: string }> | null}
  */
 let formatRestoreMapBackup = null;
 
@@ -2308,7 +2312,8 @@ async function handleRead() {
 
 /**
  * 写入前处理值：还原格式化展开态，并压缩合法 JSON
- * 不依赖 formatExpandActive 单一开关，避免状态丢失后把展开态写进去
+ * - 未编辑：优先按原文还原嵌套字符串
+ * - 已编辑：按当前展开对象重序列化，保留内层修改
  * @param {string} rawText
  * @returns {{ text: string, restoredCount: number, usedFallback: boolean, minified: boolean }}
  */
@@ -2319,7 +2324,7 @@ function prepareValueForWrite(rawText) {
   let minified = false;
   const restoreMap = getActiveFormatRestoreMap();
 
-  // 1) 优先按还原表把嵌套字符串还原回去
+  // 1) 按还原表折叠嵌套字符串
   if (restoreMap && restoreMap.size > 0) {
     try {
       const parsed = JSON.parse(text.trim());
@@ -2337,17 +2342,17 @@ function prepareValueForWrite(rawText) {
         nestedStringRestoreMap = previousMap;
       }
     } catch {
-      // 继续走原文回退
+      // 继续后续逻辑
     }
   }
 
-  // 2) 还原表无效但还留着格式化前原文 → 直接回退原文（格式化仅作阅读）
-  if (restoredCount === 0 && preFormatRootText) {
+  // 2) 仅「未编辑」且还原失败时回退整段原文；已编辑绝不用原文盖掉改动
+  if (restoredCount === 0 && preFormatRootText && !formatExpandDirty) {
     text = preFormatRootText;
     usedFallback = true;
   }
 
-  // 3) 合法 JSON 一律压缩（去掉缩进）；已 minify 的再 parse 一次也无妨
+  // 3) 合法 JSON 一律压缩
   try {
     text = JSON.stringify(JSON.parse(text.trim()));
     minified = true;
@@ -2360,7 +2365,7 @@ function prepareValueForWrite(rawText) {
 
 /**
  * 获取当前可用的格式化还原表
- * @returns {Map<string, string> | null}
+ * @returns {Map<string, { prefix: string, suffix: string, original: string }> | null}
  */
 function getActiveFormatRestoreMap() {
   if (nestedStringRestoreMap.size > 0) {
@@ -2427,8 +2432,11 @@ async function handleWrite() {
     }
 
     setBusy(true);
+    const keptEditsOnWrite = formatExpandDirty && prepared.restoredCount > 0;
     if (prepared.usedFallback) {
       setActionStatus('已回退格式化前原文并压缩，写入中...');
+    } else if (keptEditsOnWrite) {
+      setActionStatus(`已按编辑重序列化 ${prepared.restoredCount} 处并压缩，写入中...`);
     } else if (prepared.restoredCount > 0) {
       setActionStatus(`已还原 ${prepared.restoredCount} 处并压缩，写入中...`);
     } else if (prepared.minified) {
@@ -2491,6 +2499,8 @@ async function handleWrite() {
     let prepareTip = '';
     if (prepared.usedFallback) {
       prepareTip = '，已回退格式化前原文';
+    } else if (keptEditsOnWrite) {
+      prepareTip = `，已保留编辑并还原 ${prepared.restoredCount} 处嵌套字符串`;
     } else if (prepared.restoredCount > 0) {
       prepareTip = `，已还原 ${prepared.restoredCount} 处嵌套字符串`;
     } else if (prepared.minified) {
@@ -3067,16 +3077,12 @@ function extractBalancedJsonFragment(text) {
 }
 
 /**
- * 递归格式化时记录：路径 -> 展开前的原始字符串
- * （状态变量已在文件前部声明：nestedStringRestoreMap / formatExpandActive / preFormatRootText / formatRestoreMapBackup）
- */
-
-/**
  * 清空格式化展开态与还原信息
  */
 function clearFormatRestoreState() {
   nestedStringRestoreMap.clear();
   formatExpandActive = false;
+  formatExpandDirty = false;
   preFormatRootText = '';
   formatRestoreMapBackup = null;
 }
@@ -3124,22 +3130,32 @@ function stringifyForDisplay(value, space = 2) {
 }
 
 /**
- * 记录嵌套字符串原文，并返回继续递归的解析结果
+ * 记录嵌套字符串还原信息，并返回继续递归的解析结果
  * @param {string} path
  * @param {string} original
  * @param {any} parsed
  * @param {{ expandedCount: number }} counter
  * @param {number} depth
+ * @param {string} [prefix]
+ * @param {string} [suffix]
  * @returns {any}
  */
-function registerNestedStringExpansion(path, original, parsed, counter, depth) {
+function registerNestedStringExpansion(
+  path,
+  original,
+  parsed,
+  counter,
+  depth,
+  prefix = '',
+  suffix = ''
+) {
   counter.expandedCount += 1;
-  nestedStringRestoreMap.set(path, original);
+  nestedStringRestoreMap.set(path, { prefix, suffix, original });
   return deepFormatJsonValue(parsed, counter, path, depth + 1);
 }
 
 /**
- * 递归格式化：将可解析的嵌套字符串展开为对象，便于阅读；并记录原文以便压缩还原
+ * 递归格式化：将可解析的嵌套字符串展开为对象，便于阅读；并记录还原信息
  * @param {any} value
  * @param {{ expandedCount: number }} counter
  * @param {string} [path]
@@ -3178,20 +3194,28 @@ function deepFormatJsonValue(value, counter, path = '', depth = 0) {
   // 整段就是 JSON / JS 对象字符串 → 展开为对象
   const directParsed = parseStructuredData(trimmed);
   if (directParsed !== null && typeof directParsed === 'object') {
-    return registerNestedStringExpansion(path, value, directParsed, counter, depth);
+    return registerNestedStringExpansion(path, value, directParsed, counter, depth, '', '');
   }
 
-  // jsCode：注释/赋值 + 对象 → 展开对象，记住原文
+  // jsCode：注释/赋值 + 对象 → 展开对象，记住前后缀与原文
   const fragment = extractBalancedJsonFragment(value);
   if (!fragment || fragment.parsed === null || typeof fragment.parsed !== 'object') {
     return value;
   }
 
-  return registerNestedStringExpansion(path, value, fragment.parsed, counter, depth);
+  return registerNestedStringExpansion(
+    path,
+    value,
+    fragment.parsed,
+    counter,
+    depth,
+    fragment.prefix,
+    fragment.suffix
+  );
 }
 
 /**
- * 压缩前还原：已展开的嵌套路径直接回写格式化前的原文
+ * 压缩前还原：未编辑用原文；已编辑则按当前对象重序列化并保留 prefix/suffix
  * @param {any} value
  * @param {{ restoredCount: number }} counter
  * @param {string} [path]
@@ -3203,27 +3227,35 @@ function deepRestoreJsonValue(value, counter, path = '', depth = 0) {
     return value;
   }
 
-  if (nestedStringRestoreMap.has(path)) {
+  const meta = nestedStringRestoreMap.get(path);
+
+  // 未编辑：直接回写原文，避免函数等被重序列化丢失
+  if (meta && !formatExpandDirty) {
     counter.restoredCount += 1;
-    return nestedStringRestoreMap.get(path);
+    return meta.original;
   }
 
+  // 已编辑或非还原路径：先递归子节点，再按需折叠
+  let nextValue = value;
   if (Array.isArray(value)) {
-    return value.map((item, index) =>
+    nextValue = value.map((item, index) =>
       deepRestoreJsonValue(item, counter, joinJsonPath(path, index), depth + 1)
     );
-  }
-
-  if (value && typeof value === 'object') {
+  } else if (value && typeof value === 'object') {
     /** @type {Record<string, any>} */
     const result = {};
     Object.entries(value).forEach(([key, child]) => {
       result[key] = deepRestoreJsonValue(child, counter, joinJsonPath(path, key), depth + 1);
     });
-    return result;
+    nextValue = result;
   }
 
-  return value;
+  if (meta && formatExpandDirty) {
+    counter.restoredCount += 1;
+    return `${meta.prefix}${JSON.stringify(nextValue)}${meta.suffix}`;
+  }
+
+  return nextValue;
 }
 
 /**
@@ -3249,14 +3281,16 @@ function handleFormatJson() {
     updateValueMeta();
     if (counter.expandedCount > 0) {
       formatExpandActive = true;
+      formatExpandDirty = false;
       formatRestoreMapBackup = new Map(nestedStringRestoreMap);
       setActionStatus(
-        `已递归格式化（解析 ${counter.expandedCount} 处嵌套对象；写入前会自动还原，不会写展开态）`,
+        `已递归格式化（解析 ${counter.expandedCount} 处嵌套对象；改内层后写入/压缩会保留修改）`,
         'success'
       );
     } else {
       preFormatRootText = '';
       formatExpandActive = false;
+      formatExpandDirty = false;
       formatRestoreMapBackup = null;
       setActionStatus('已格式化 JSON', 'success');
     }
@@ -3289,7 +3323,7 @@ function handleCompressJson() {
       } finally {
         nestedStringRestoreMap = previousMap;
       }
-    } else if (formatExpandActive && preFormatRootText) {
+    } else if (formatExpandActive && preFormatRootText && !formatExpandDirty) {
       valueInput.value = JSON.stringify(JSON.parse(preFormatRootText));
       autoResizeValueInput();
       updateValueMeta();
@@ -3300,9 +3334,15 @@ function handleCompressJson() {
     valueInput.value = JSON.stringify(restored);
     autoResizeValueInput();
     updateValueMeta();
+    const keptEdits = formatExpandDirty && counter.restoredCount > 0;
     clearFormatRestoreState();
     if (counter.restoredCount > 0) {
-      setActionStatus(`已压缩并还原 ${counter.restoredCount} 处嵌套字符串，可安全写入`, 'success');
+      setActionStatus(
+        keptEdits
+          ? `已压缩并还原 ${counter.restoredCount} 处嵌套字符串（已保留编辑）`
+          : `已压缩并还原 ${counter.restoredCount} 处嵌套字符串，可安全写入`,
+        'success'
+      );
     } else {
       setActionStatus('已压缩 JSON', 'success');
     }
@@ -3538,6 +3578,10 @@ async function initPopup() {
   formatJsonBtn.addEventListener('click', handleFormatJson);
   compressJsonBtn.addEventListener('click', handleCompressJson);
   valueInput.addEventListener('input', () => {
+    // 格式化展开后一旦改动，压缩/写入按当前内容重序列化，保留内层修改
+    if (formatExpandActive) {
+      formatExpandDirty = true;
+    }
     autoResizeValueInput();
     updateValueMeta();
   });
