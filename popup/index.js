@@ -8,7 +8,10 @@ const DEFAULT_STORAGE_TYPE = STORAGE_TYPES.localStorage;
 const LAST_TYPE_STORAGE = 'last-storage-type';
 /** 旧版共用字段，仅用于迁移 */
 const LEGACY_LAST_VALUE_STORAGE = 'last-storage-value';
+const AUTO_READ_SETTING = 'setting-auto-read';
 const HISTORY_LIMIT = 10;
+const SUGGEST_LIMIT = 8;
+const DIFF_PREVIEW_LIMIT = 240;
 /** Chrome 插件 popup 高度实际上限 */
 const CHROME_POPUP_HEIGHT_LIMIT = 600;
 /** 值输入框最大高度（超出内部滚动） */
@@ -40,6 +43,7 @@ const clearBtn = document.getElementById('clearBtn');
 const clearKeyBtn = document.getElementById('clearKeyBtn');
 const formatJsonBtn = document.getElementById('formatJsonBtn');
 const compressJsonBtn = document.getElementById('compressJsonBtn');
+const browseKeysBtn = document.getElementById('browseKeysBtn');
 const routeSectionEl = document.getElementById('routeSection');
 const routeToggleBtn = document.getElementById('routeToggleBtn');
 const routeInfoEl = document.getElementById('routeInfo');
@@ -54,11 +58,37 @@ const cookieMaxAgeInput = document.getElementById('cookieMaxAge');
 const cookieDomainInput = document.getElementById('cookieDomain');
 const cookieSameSiteSelect = document.getElementById('cookieSameSite');
 const cookieSecureCheckbox = document.getElementById('cookieSecure');
+const autoReadToggle = document.getElementById('autoReadToggle');
+const keySuggestListEl = document.getElementById('keySuggestList');
+const keysPanelEl = document.getElementById('keysPanel');
+const keysFilterInput = document.getElementById('keysFilterInput');
+const keysListEl = document.getElementById('keysList');
+const keysEmptyTipEl = document.getElementById('keysEmptyTip');
+const refreshKeysBtn = document.getElementById('refreshKeysBtn');
+const exportBtn = document.getElementById('exportBtn');
+const importBtn = document.getElementById('importBtn');
+const importFileInput = document.getElementById('importFileInput');
+const valueByteMetaEl = document.getElementById('valueByteMeta');
+const valueJsonMetaEl = document.getElementById('valueJsonMeta');
+const confirmDialog = document.getElementById('confirmDialog');
+const confirmTitleEl = document.getElementById('confirmTitle');
+const confirmBodyEl = document.getElementById('confirmBody');
+const confirmOkBtn = document.getElementById('confirmOkBtn');
 
 /** @type {string} */
 let currentStorageType = DEFAULT_STORAGE_TYPE;
 /** 读写/删除互斥锁 */
 let isBusy = false;
+/** @type {string[]} */
+let historyKeyCache = [];
+/** @type {string[]} */
+let pageKeyCache = [];
+/** @type {Record<string, string>} */
+let pageEntriesCache = {};
+/** @type {Array<{ key: string, source: string }>} */
+let suggestItems = [];
+let suggestActiveIndex = -1;
+let suggestBlurTimer = null;
 
 /**
  * 获取某存储类型最近一次 key 的缓存字段
@@ -89,7 +119,6 @@ function getLastValueField(storageType) {
 
 /**
  * 在页面上下文中按类型读取
- * 注意：此函数会被注入页面，内部逻辑需自包含
  * @param {string} storageType
  * @param {string} key
  */
@@ -101,11 +130,6 @@ function readPageStorage(storageType, key) {
     origin: window.location.origin,
   };
 
-  /**
-   * 从 document.cookie 解析指定 key
-   * @param {string} cookieKeyName
-   * @returns {string | null}
-   */
   function getCookieValue(cookieKeyName) {
     const pairs = document.cookie ? document.cookie.split('; ') : [];
     for (const pair of pairs) {
@@ -141,6 +165,161 @@ function readPageStorage(storageType, key) {
 }
 
 /**
+ * 列出页面某类型全部 key 与条目
+ * @param {string} storageType
+ */
+function listPageStorageKeys(storageType) {
+  const routeInfo = {
+    href: window.location.href,
+    hash: window.location.hash,
+    pathname: window.location.pathname,
+    origin: window.location.origin,
+  };
+
+  /** @type {Record<string, string>} */
+  const entries = {};
+
+  if (storageType === 'localStorage') {
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const key = window.localStorage.key(index);
+      if (key != null) {
+        entries[key] = window.localStorage.getItem(key) ?? '';
+      }
+    }
+  } else if (storageType === 'sessionStorage') {
+    for (let index = 0; index < window.sessionStorage.length; index += 1) {
+      const key = window.sessionStorage.key(index);
+      if (key != null) {
+        entries[key] = window.sessionStorage.getItem(key) ?? '';
+      }
+    }
+  } else {
+    const pairs = document.cookie ? document.cookie.split('; ') : [];
+    for (const pair of pairs) {
+      const equalIndex = pair.indexOf('=');
+      const cookieKey = equalIndex >= 0 ? pair.slice(0, equalIndex) : pair;
+      const cookieValue = equalIndex >= 0 ? pair.slice(equalIndex + 1) : '';
+      let decodedKey = cookieKey;
+      let decodedValue = cookieValue;
+      try {
+        decodedKey = decodeURIComponent(cookieKey);
+      } catch {
+        // 保持原 key
+      }
+      try {
+        decodedValue = decodeURIComponent(cookieValue);
+      } catch {
+        // 保持原 value
+      }
+      if (decodedKey) {
+        entries[decodedKey] = decodedValue;
+      }
+    }
+  }
+
+  const keys = Object.keys(entries).sort((left, right) => left.localeCompare(right));
+  return { ...routeInfo, keys, entries };
+}
+
+/**
+ * 批量写入页面存储
+ * @param {string} storageType
+ * @param {Record<string, string>} entries
+ * @param {{ path?: string, maxAge?: number | null, domain?: string, secure?: boolean, sameSite?: string }} [cookieOptions]
+ */
+function writePageStorageBatch(storageType, entries, cookieOptions = {}) {
+  const routeInfo = {
+    href: window.location.href,
+    hash: window.location.hash,
+    pathname: window.location.pathname,
+    origin: window.location.origin,
+  };
+
+  function getCookieValue(cookieKeyName) {
+    const pairs = document.cookie ? document.cookie.split('; ') : [];
+    for (const pair of pairs) {
+      const equalIndex = pair.indexOf('=');
+      const cookieKey = equalIndex >= 0 ? pair.slice(0, equalIndex) : pair;
+      const cookieValue = equalIndex >= 0 ? pair.slice(equalIndex + 1) : '';
+      let decodedKey = cookieKey;
+      try {
+        decodedKey = decodeURIComponent(cookieKey);
+      } catch {
+        // 保持原 key
+      }
+      if (decodedKey === cookieKeyName) {
+        try {
+          return decodeURIComponent(cookieValue);
+        } catch {
+          return cookieValue;
+        }
+      }
+    }
+    return null;
+  }
+
+  let successCount = 0;
+  let failCount = 0;
+  const entryList = Object.entries(entries || {});
+
+  for (const [key, rawValue] of entryList) {
+    const value = rawValue == null ? '' : String(rawValue);
+    try {
+      if (storageType === 'localStorage') {
+        window.localStorage.setItem(key, value);
+        if (window.localStorage.getItem(key) === value) {
+          successCount += 1;
+        } else {
+          failCount += 1;
+        }
+      } else if (storageType === 'sessionStorage') {
+        window.sessionStorage.setItem(key, value);
+        if (window.sessionStorage.getItem(key) === value) {
+          successCount += 1;
+        } else {
+          failCount += 1;
+        }
+      } else {
+        const path = cookieOptions.path || '/';
+        const domain = typeof cookieOptions.domain === 'string' ? cookieOptions.domain.trim() : '';
+        let sameSite = typeof cookieOptions.sameSite === 'string' ? cookieOptions.sameSite : '';
+        let secure = Boolean(cookieOptions.secure);
+        if (sameSite === 'None') {
+          secure = true;
+        }
+        const parts = [`${encodeURIComponent(key)}=${encodeURIComponent(value)}`, `path=${path}`];
+        if (domain) {
+          parts.push(`domain=${domain}`);
+        }
+        if (
+          cookieOptions.maxAge !== null &&
+          cookieOptions.maxAge !== undefined &&
+          Number.isFinite(cookieOptions.maxAge)
+        ) {
+          parts.push(`Max-Age=${Math.floor(cookieOptions.maxAge)}`);
+        }
+        if (sameSite) {
+          parts.push(`SameSite=${sameSite}`);
+        }
+        if (secure) {
+          parts.push('Secure');
+        }
+        document.cookie = parts.join('; ');
+        if (getCookieValue(key) === value) {
+          successCount += 1;
+        } else {
+          failCount += 1;
+        }
+      }
+    } catch {
+      failCount += 1;
+    }
+  }
+
+  return { ...routeInfo, successCount, failCount, total: entryList.length };
+}
+
+/**
  * 在页面上下文中按类型写入
  * @param {string} storageType
  * @param {string} key
@@ -155,11 +334,6 @@ function writePageStorage(storageType, key, value, cookieOptions = {}) {
     origin: window.location.origin,
   };
 
-  /**
-   * 从 document.cookie 解析指定 key
-   * @param {string} cookieKeyName
-   * @returns {string | null}
-   */
   function getCookieValue(cookieKeyName) {
     const pairs = document.cookie ? document.cookie.split('; ') : [];
     for (const pair of pairs) {
@@ -199,7 +373,6 @@ function writePageStorage(storageType, key, value, cookieOptions = {}) {
   const domain = typeof cookieOptions.domain === 'string' ? cookieOptions.domain.trim() : '';
   let sameSite = typeof cookieOptions.sameSite === 'string' ? cookieOptions.sameSite : '';
   let secure = Boolean(cookieOptions.secure);
-  // SameSite=None 时浏览器要求 Secure
   if (sameSite === 'None') {
     secure = true;
   }
@@ -220,12 +393,10 @@ function writePageStorage(storageType, key, value, cookieOptions = {}) {
 
   document.cookie = parts.join('; ');
   const readValue = getCookieValue(key);
-  const success = readValue === value;
-
   return {
     ...routeInfo,
     value: readValue,
-    success,
+    success: readValue === value,
     cookieMeta: { path, domain, secure, sameSite, maxAge: cookieOptions.maxAge ?? null },
   };
 }
@@ -244,11 +415,6 @@ function deletePageStorage(storageType, key, cookieOptions = {}) {
     origin: window.location.origin,
   };
 
-  /**
-   * 从 document.cookie 解析指定 key
-   * @param {string} cookieKeyName
-   * @returns {string | null}
-   */
   function getCookieValue(cookieKeyName) {
     const pairs = document.cookie ? document.cookie.split('; ') : [];
     for (const pair of pairs) {
@@ -314,8 +480,7 @@ function assertInjectableTab(tab) {
     throw new Error('当前页面不支持读写存储（系统页/扩展页）');
   }
 
-  const blockedPrefix = BLOCKED_URL_PREFIXES.find((prefix) => tab.url.startsWith(prefix));
-  if (blockedPrefix) {
+  if (BLOCKED_URL_PREFIXES.some((prefix) => tab.url.startsWith(prefix))) {
     throw new Error('当前页面不支持读写存储（系统页/扩展页）');
   }
 
@@ -400,6 +565,19 @@ function escapeHtml(text) {
 }
 
 /**
+ * 截断预览文案
+ * @param {string} text
+ * @param {number} [limit]
+ * @returns {string}
+ */
+function truncateText(text, limit = DIFF_PREVIEW_LIMIT) {
+  if (text.length <= limit) {
+    return text;
+  }
+  return `${text.slice(0, limit)}…（共 ${text.length} 字符）`;
+}
+
+/**
  * 设置状态文案
  * @param {string} text
  * @param {'success' | 'error' | 'empty' | ''} type
@@ -410,7 +588,7 @@ function setStatus(text, type = '') {
 }
 
 /**
- * 获取存储类型展示名（与 Web API / Tab 文案保持一致）
+ * 获取存储类型展示名
  * @param {string} storageType
  * @returns {string}
  */
@@ -422,6 +600,14 @@ function getStorageTypeLabel(storageType) {
     return 'cookie';
   }
   return 'localStorage';
+}
+
+/**
+ * 是否开启自动读取
+ * @returns {boolean}
+ */
+function isAutoReadEnabled() {
+  return autoReadToggle.checked;
 }
 
 /**
@@ -437,6 +623,7 @@ function syncClearKeyButton() {
 function handleClearKey() {
   storageKeyInput.value = '';
   syncClearKeyButton();
+  hideKeySuggest();
   storageKeyInput.focus();
 }
 
@@ -480,6 +667,57 @@ function setBusy(busy) {
   readBtn.disabled = busy;
   writeBtn.disabled = busy;
   deleteBtn.disabled = busy;
+  browseKeysBtn.disabled = busy;
+  exportBtn.disabled = busy;
+  importBtn.disabled = busy;
+  refreshKeysBtn.disabled = busy;
+}
+
+/**
+ * 更新值区字节数 / JSON 状态
+ */
+function updateValueMeta() {
+  const text = valueInput.value;
+  if (!text) {
+    valueByteMetaEl.textContent = '';
+    valueJsonMetaEl.textContent = '';
+    valueJsonMetaEl.className = 'value-json-meta';
+    return;
+  }
+
+  const byteLength = new TextEncoder().encode(text).length;
+  valueByteMetaEl.textContent = `${text.length} 字符 · ${byteLength} 字节`;
+
+  try {
+    JSON.parse(text);
+    valueJsonMetaEl.textContent = '合法 JSON';
+    valueJsonMetaEl.className = 'value-json-meta is-valid';
+  } catch {
+    valueJsonMetaEl.textContent = '非 JSON';
+    valueJsonMetaEl.className = 'value-json-meta is-invalid';
+  }
+}
+
+/**
+ * 弹出确认框
+ * @param {{ title: string, body: string, okText?: string, danger?: boolean }} options
+ * @returns {Promise<boolean>}
+ */
+function showConfirmDialog(options) {
+  const { title, body, okText = '确认', danger = false } = options;
+  confirmTitleEl.textContent = title;
+  confirmBodyEl.textContent = body;
+  confirmOkBtn.textContent = okText;
+  confirmOkBtn.className = danger ? 'btn btn-danger' : 'btn btn-primary';
+
+  return new Promise((resolve) => {
+    const onClose = () => {
+      confirmDialog.removeEventListener('close', onClose);
+      resolve(confirmDialog.returnValue === 'ok');
+    };
+    confirmDialog.addEventListener('close', onClose);
+    confirmDialog.showModal();
+  });
 }
 
 /**
@@ -503,6 +741,8 @@ function normalizeHistoryList(list) {
  */
 function renderKeyHistory(historyList) {
   const list = normalizeHistoryList(historyList);
+  historyKeyCache = list;
+
   if (!list.length) {
     historyPanelEl.hidden = true;
     historyRowEl.innerHTML = '';
@@ -522,7 +762,6 @@ function renderKeyHistory(historyList) {
     })
     .join('');
 
-  // 超出两行时开启滚动，并固定显示滚动条提示可滚动
   requestAnimationFrame(() => {
     const canScroll = historyRowEl.scrollHeight > historyRowEl.clientHeight + 1;
     historyRowEl.classList.toggle('is-scrollable', canScroll);
@@ -591,7 +830,6 @@ async function loadAndRenderKeyHistory() {
   const stored = await chrome.storage.local.get([historyField, lastKeyField]);
   let historyList = normalizeHistoryList(stored[historyField]);
 
-  // 兼容旧数据：仅有 last-key 时补进历史
   const lastKey = typeof stored[lastKeyField] === 'string' ? stored[lastKeyField].trim() : '';
   if (!historyList.length && lastKey) {
     historyList = [lastKey];
@@ -660,8 +898,181 @@ function renderActiveTab() {
     const isActive = button.dataset.type === currentStorageType;
     button.classList.toggle('is-active', isActive);
     button.setAttribute('aria-selected', String(isActive));
+    button.tabIndex = isActive ? 0 : -1;
   });
   updateKeyPlaceholder();
+}
+
+/**
+ * 刷新页面 key 缓存，并按需渲染列表
+ * @param {boolean} [renderList]
+ */
+async function refreshPageKeys(renderList = false) {
+  try {
+    const tab = await getActiveTab();
+    assertInjectableTab(tab);
+    const pageData = await executeInTab(tab.id, listPageStorageKeys, [currentStorageType]);
+    pageKeyCache = Array.isArray(pageData.keys) ? pageData.keys : [];
+    pageEntriesCache =
+      pageData.entries && typeof pageData.entries === 'object' ? pageData.entries : {};
+    renderRouteInfo(pageData);
+    if (renderList || !keysPanelEl.hidden) {
+      renderKeysList(keysFilterInput.value.trim());
+    }
+    return pageData;
+  } catch (error) {
+    pageKeyCache = [];
+    pageEntriesCache = {};
+    if (renderList || !keysPanelEl.hidden) {
+      renderKeysList(keysFilterInput.value.trim());
+    }
+    throw error;
+  }
+}
+
+/**
+ * 渲染全部 Key 列表
+ * @param {string} [filterText]
+ */
+function renderKeysList(filterText = '') {
+  const keyword = filterText.trim().toLowerCase();
+  const filteredKeys = pageKeyCache.filter((key) => !keyword || key.toLowerCase().includes(keyword));
+
+  if (!filteredKeys.length) {
+    keysListEl.innerHTML = '';
+    keysEmptyTipEl.hidden = false;
+    keysEmptyTipEl.textContent = pageKeyCache.length ? '无匹配 key' : '暂无 key';
+    return;
+  }
+
+  keysEmptyTipEl.hidden = true;
+  keysListEl.innerHTML = filteredKeys
+    .map((key) => {
+      const encodedKey = encodeURIComponent(key);
+      const safeLabel = escapeHtml(key);
+      return `<button class="keys-item" type="button" data-key="${encodedKey}" title="${safeLabel}">${safeLabel}</button>`;
+    })
+    .join('');
+}
+
+/**
+ * 切换全部 Key 面板
+ */
+async function toggleKeysPanel() {
+  if (!keysPanelEl.hidden) {
+    keysPanelEl.hidden = true;
+    return;
+  }
+
+  keysPanelEl.hidden = false;
+  keysFilterInput.value = '';
+  setStatus('正在加载全部 Key...', '');
+  try {
+    await refreshPageKeys(true);
+    setStatus(`共 ${pageKeyCache.length} 个 key`, pageKeyCache.length ? 'success' : 'empty');
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : '加载 Key 失败', 'error');
+  }
+}
+
+/**
+ * 合并联想候选
+ * @param {string} query
+ * @returns {Array<{ key: string, source: string }>}
+ */
+function buildSuggestItems(query) {
+  const keyword = query.trim().toLowerCase();
+  /** @type {Map<string, string>} */
+  const merged = new Map();
+
+  historyKeyCache.forEach((key) => {
+    if (!keyword || key.toLowerCase().includes(keyword)) {
+      merged.set(key, '历史');
+    }
+  });
+
+  pageKeyCache.forEach((key) => {
+    if (!keyword || key.toLowerCase().includes(keyword)) {
+      if (!merged.has(key)) {
+        merged.set(key, '页面');
+      } else if (merged.get(key) === '历史') {
+        merged.set(key, '历史/页面');
+      }
+    }
+  });
+
+  return Array.from(merged.entries())
+    .map(([key, source]) => ({ key, source }))
+    .slice(0, SUGGEST_LIMIT);
+}
+
+/**
+ * 隐藏联想列表
+ */
+function hideKeySuggest() {
+  suggestItems = [];
+  suggestActiveIndex = -1;
+  keySuggestListEl.hidden = true;
+  keySuggestListEl.innerHTML = '';
+}
+
+/**
+ * 渲染联想列表
+ */
+function renderKeySuggest() {
+  if (!suggestItems.length) {
+    hideKeySuggest();
+    return;
+  }
+
+  keySuggestListEl.hidden = false;
+  keySuggestListEl.innerHTML = suggestItems
+    .map((item, index) => {
+      const activeClass = index === suggestActiveIndex ? ' is-active' : '';
+      return `<li class="key-suggest-item${activeClass}" role="option" data-index="${index}">
+        <span>${escapeHtml(item.key)}</span>
+        <span class="key-suggest-source">${escapeHtml(item.source)}</span>
+      </li>`;
+    })
+    .join('');
+}
+
+/**
+ * 刷新并展示联想
+ */
+async function updateKeySuggest(forceShow = false) {
+  const query = storageKeyInput.value;
+  if (!forceShow && !query.trim() && document.activeElement !== storageKeyInput) {
+    hideKeySuggest();
+    return;
+  }
+
+  if (!pageKeyCache.length) {
+    try {
+      await refreshPageKeys(false);
+    } catch {
+      // 联想失败时仍可用历史
+    }
+  }
+
+  suggestItems = buildSuggestItems(query);
+  suggestActiveIndex = suggestItems.length ? 0 : -1;
+  renderKeySuggest();
+}
+
+/**
+ * 选中联想项
+ * @param {number} index
+ */
+async function selectSuggestItem(index) {
+  const item = suggestItems[index];
+  if (!item) {
+    return;
+  }
+  hideKeySuggest();
+  storageKeyInput.value = item.key;
+  syncClearKeyButton();
+  await handleRead();
 }
 
 /**
@@ -680,31 +1091,44 @@ async function switchStorageType(storageType) {
 
   currentStorageType = storageType;
   renderActiveTab();
+  hideKeySuggest();
+  pageKeyCache = [];
+  pageEntriesCache = {};
 
   const historyList = await loadAndRenderKeyHistory();
   storageKeyInput.value = historyList[0] || '';
   syncClearKeyButton();
   await chrome.storage.local.set({ [LAST_TYPE_STORAGE]: storageType });
 
-  if (storageKeyInput.value.trim()) {
+  if (!keysPanelEl.hidden) {
+    try {
+      await refreshPageKeys(true);
+    } catch {
+      renderKeysList(keysFilterInput.value.trim());
+    }
+  }
+
+  if (storageKeyInput.value.trim() && isAutoReadEnabled()) {
     await handleRead();
   } else {
     const lastValueField = getLastValueField(storageType);
     const stored = await chrome.storage.local.get(lastValueField);
     valueInput.value = typeof stored[lastValueField] === 'string' ? stored[lastValueField] : '';
     autoResizeValueInput();
-    setStatus('请输入 key 后读取', '');
+    updateValueMeta();
+    setStatus(storageKeyInput.value.trim() ? '已关闭自动读取，可手动点击读取' : '请输入 key 后读取', '');
   }
 }
 
 /**
- * 点击历史记录填充并读取
+ * 点击历史 / 列表 key 填充并读取
  * @param {string} key
  */
 async function handleSelectHistoryKey(key) {
   if (isBusy) {
     return;
   }
+  hideKeySuggest();
   storageKeyInput.value = key;
   syncClearKeyButton();
   await handleRead();
@@ -737,6 +1161,7 @@ async function handleRead() {
     if (pageData.value === null) {
       valueInput.value = '';
       autoResizeValueInput();
+      updateValueMeta();
       const tip =
         currentStorageType === STORAGE_TYPES.cookie
           ? `cookie "${key}" 不存在（HttpOnly cookie 无法通过脚本读取）`
@@ -745,8 +1170,19 @@ async function handleRead() {
     } else {
       valueInput.value = pageData.value;
       autoResizeValueInput();
+      updateValueMeta();
       await saveLastValue(pageData.value);
-      setStatus(`读取成功（${getStorageTypeLabel(currentStorageType)}），长度 ${pageData.value.length}`, 'success');
+      const byteLength = new TextEncoder().encode(pageData.value).length;
+      setStatus(
+        `读取成功（${getStorageTypeLabel(currentStorageType)}），${pageData.value.length} 字符 · ${byteLength} 字节`,
+        'success'
+      );
+    }
+
+    if (!keysPanelEl.hidden) {
+      refreshPageKeys(true).catch(() => {});
+    } else {
+      refreshPageKeys(false).catch(() => {});
     }
   } catch (error) {
     setStatus(error instanceof Error ? error.message : '读取失败', 'error');
@@ -775,12 +1211,36 @@ async function handleWrite() {
     return;
   }
 
-  setBusy(true);
-  setStatus('写入中...');
-
   try {
     const tab = await getActiveTab();
     assertInjectableTab(tab);
+
+    const existingData = await executeInTab(tab.id, readPageStorage, [currentStorageType, key]);
+    if (existingData.value !== null && existingData.value !== value) {
+      const confirmed = await showConfirmDialog({
+        title: `确认覆盖写入「${key}」？`,
+        body: `旧值（${existingData.value.length} 字符）：\n${truncateText(existingData.value)}\n\n新值（${value.length} 字符）：\n${truncateText(value)}`,
+        okText: '确认覆盖',
+        danger: true,
+      });
+      if (!confirmed) {
+        setStatus('已取消写入', 'empty');
+        return;
+      }
+    } else if (existingData.value === null) {
+      const confirmed = await showConfirmDialog({
+        title: `确认新建写入「${key}」？`,
+        body: `将写入新值（${value.length} 字符）：\n${truncateText(value)}`,
+        okText: '确认写入',
+      });
+      if (!confirmed) {
+        setStatus('已取消写入', 'empty');
+        return;
+      }
+    }
+
+    setBusy(true);
+    setStatus('写入中...');
 
     const cookieOptions =
       currentStorageType === STORAGE_TYPES.cookie ? getCookieWriteOptions() : undefined;
@@ -793,6 +1253,7 @@ async function handleWrite() {
     renderRouteInfo(pageData);
     valueInput.value = pageData.value ?? value;
     autoResizeValueInput();
+    updateValueMeta();
     await pushKeyHistory(key);
     await saveLastValue(value);
 
@@ -829,6 +1290,12 @@ async function handleWrite() {
       `写入成功：${getStorageTypeLabel(currentStorageType)} / ${key}（长度 ${value.length}）${cookieTip}`,
       'success'
     );
+
+    if (!keysPanelEl.hidden) {
+      refreshPageKeys(true).catch(() => {});
+    } else {
+      refreshPageKeys(false).catch(() => {});
+    }
   } catch (error) {
     setStatus(error instanceof Error ? error.message : '写入失败', 'error');
   } finally {
@@ -850,17 +1317,34 @@ async function handleDelete() {
   }
 
   const typeLabel = getStorageTypeLabel(currentStorageType);
-  const confirmed = window.confirm(`确认删除 ${typeLabel} 中的 key「${key}」？此操作不可撤销。`);
-  if (!confirmed) {
-    return;
-  }
-
-  setBusy(true);
-  setStatus('删除中...');
 
   try {
     const tab = await getActiveTab();
     assertInjectableTab(tab);
+    const existingData = await executeInTab(tab.id, readPageStorage, [currentStorageType, key]);
+
+    let body =
+      existingData.value === null
+        ? `当前读不到「${key}」的值（可能不存在或为 HttpOnly）。仍尝试删除？`
+        : `将删除「${key}」当前值（${existingData.value.length} 字符）：\n${truncateText(existingData.value)}`;
+
+    if (currentStorageType === STORAGE_TYPES.cookie) {
+      body += '\n\n提示：若删除失败，可尝试调整上方 Path / Domain 后再删。';
+    }
+
+    const confirmed = await showConfirmDialog({
+      title: `确认删除 ${typeLabel} / ${key}？`,
+      body,
+      okText: '确认删除',
+      danger: true,
+    });
+    if (!confirmed) {
+      setStatus('已取消删除', 'empty');
+      return;
+    }
+
+    setBusy(true);
+    setStatus('删除中...');
 
     const writeOptions =
       currentStorageType === STORAGE_TYPES.cookie ? getCookieWriteOptions() : null;
@@ -877,7 +1361,7 @@ async function handleDelete() {
     if (!pageData.success) {
       const failTip =
         currentStorageType === STORAGE_TYPES.cookie
-          ? '删除失败：cookie 仍存在（path/domain 可能不匹配，或为 HttpOnly）'
+          ? '删除失败：cookie 仍存在。可尝试修改 Path/Domain 后再删；HttpOnly cookie 无法通过脚本删除'
           : '删除失败：key 仍存在';
       setStatus(failTip, 'error');
       return;
@@ -885,13 +1369,144 @@ async function handleDelete() {
 
     valueInput.value = '';
     autoResizeValueInput();
+    updateValueMeta();
     await pushKeyHistory(key);
     await saveLastValue('');
     setStatus(`已删除：${typeLabel} / ${key}`, 'success');
+
+    if (!keysPanelEl.hidden) {
+      refreshPageKeys(true).catch(() => {});
+    } else {
+      refreshPageKeys(false).catch(() => {});
+    }
   } catch (error) {
     setStatus(error instanceof Error ? error.message : '删除失败', 'error');
   } finally {
     setBusy(false);
+  }
+}
+
+/**
+ * 导出当前类型全部条目
+ */
+async function handleExport() {
+  if (isBusy) {
+    return;
+  }
+
+  setBusy(true);
+  setStatus('导出中...');
+
+  try {
+    const pageData = await refreshPageKeys(true);
+    const payload = {
+      type: currentStorageType,
+      exportedAt: new Date().toISOString(),
+      origin: pageData.origin || '',
+      data: pageData.entries || {},
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = `${currentStorageType}-${Date.now()}.json`;
+    anchor.click();
+    URL.revokeObjectURL(objectUrl);
+    setStatus(`已导出 ${Object.keys(payload.data).length} 个 key`, 'success');
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : '导出失败', 'error');
+  } finally {
+    setBusy(false);
+  }
+}
+
+/**
+ * 解析导入 JSON
+ * @param {string} text
+ * @returns {Record<string, string>}
+ */
+function parseImportEntries(text) {
+  const parsed = JSON.parse(text);
+  let rawEntries = parsed;
+
+  if (parsed && typeof parsed === 'object' && parsed.data && typeof parsed.data === 'object') {
+    rawEntries = parsed.data;
+  }
+
+  if (!rawEntries || typeof rawEntries !== 'object' || Array.isArray(rawEntries)) {
+    throw new Error('导入格式无效，需要 { key: value } 或 { data: { key: value } }');
+  }
+
+  /** @type {Record<string, string>} */
+  const entries = {};
+  Object.entries(rawEntries).forEach(([key, value]) => {
+    if (typeof key === 'string' && key.trim()) {
+      entries[key] = value == null ? '' : String(value);
+    }
+  });
+
+  if (!Object.keys(entries).length) {
+    throw new Error('导入内容为空');
+  }
+
+  return entries;
+}
+
+/**
+ * 导入 JSON 并批量写入
+ * @param {File} file
+ */
+async function handleImportFile(file) {
+  if (isBusy) {
+    return;
+  }
+
+  try {
+    const text = await file.text();
+    const entries = parseImportEntries(text);
+    const keys = Object.keys(entries);
+    const preview = keys
+      .slice(0, 8)
+      .map((key) => `- ${key}`)
+      .join('\n');
+    const moreTip = keys.length > 8 ? `\n…共 ${keys.length} 个 key` : '';
+
+    const confirmed = await showConfirmDialog({
+      title: `确认导入到 ${getStorageTypeLabel(currentStorageType)}？`,
+      body: `将写入 / 覆盖以下 key：\n${preview}${moreTip}`,
+      okText: '确认导入',
+      danger: true,
+    });
+    if (!confirmed) {
+      setStatus('已取消导入', 'empty');
+      return;
+    }
+
+    setBusy(true);
+    setStatus('导入中...');
+
+    const tab = await getActiveTab();
+    assertInjectableTab(tab);
+    const cookieOptions =
+      currentStorageType === STORAGE_TYPES.cookie ? getCookieWriteOptions() : undefined;
+    const result = await executeInTab(tab.id, writePageStorageBatch, [
+      currentStorageType,
+      entries,
+      cookieOptions,
+    ]);
+    renderRouteInfo(result);
+    await refreshPageKeys(true);
+
+    if (result.failCount > 0) {
+      setStatus(`导入完成：成功 ${result.successCount}，失败 ${result.failCount}`, 'error');
+    } else {
+      setStatus(`导入成功：${result.successCount} 个 key`, 'success');
+    }
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : '导入失败', 'error');
+  } finally {
+    setBusy(false);
+    importFileInput.value = '';
   }
 }
 
@@ -926,6 +1541,7 @@ async function handlePaste() {
     }
     valueInput.value = text;
     autoResizeValueInput();
+    updateValueMeta();
     setStatus(`已粘贴，长度 ${text.length}，可点击「写入」`, 'success');
     valueInput.focus();
   } catch {
@@ -947,6 +1563,7 @@ function handleFormatJson() {
   try {
     valueInput.value = JSON.stringify(JSON.parse(text), null, 2);
     autoResizeValueInput();
+    updateValueMeta();
     setStatus('已格式化 JSON', 'success');
   } catch {
     setStatus('不是合法 JSON，无法格式化', 'error');
@@ -966,6 +1583,7 @@ function handleCompressJson() {
   try {
     valueInput.value = JSON.stringify(JSON.parse(text));
     autoResizeValueInput();
+    updateValueMeta();
     setStatus('已压缩 JSON', 'success');
   } catch {
     setStatus('不是合法 JSON，无法压缩', 'error');
@@ -984,8 +1602,7 @@ function autoResizeValueInput() {
 }
 
 /**
- * 设置弹窗最大高度（内容自适应，超出后滚动）
- * 说明：插件 popup 内 vh 无效，按屏幕可用高度 80% 计算，并受 Chrome 上限约束
+ * 设置弹窗最大高度
  */
 function applyPopupMaxHeight() {
   const screenBasedHeight = Math.floor(window.screen.availHeight * 0.8);
@@ -999,6 +1616,7 @@ function applyPopupMaxHeight() {
 function handleClear() {
   valueInput.value = '';
   autoResizeValueInput();
+  updateValueMeta();
   setStatus('已清空', '');
   valueInput.focus();
 }
@@ -1013,6 +1631,38 @@ function isSubmitShortcut(event) {
 }
 
 /**
+ * Tab 左右方向键切换
+ * @param {KeyboardEvent} event
+ */
+function handleTablistKeydown(event) {
+  const tabButtons = Array.from(storageTypeTabsEl.querySelectorAll('.tab-item'));
+  const currentIndex = tabButtons.findIndex((button) => button.dataset.type === currentStorageType);
+  if (currentIndex < 0) {
+    return;
+  }
+
+  let nextIndex = currentIndex;
+  if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+    nextIndex = (currentIndex + 1) % tabButtons.length;
+  } else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+    nextIndex = (currentIndex - 1 + tabButtons.length) % tabButtons.length;
+  } else if (event.key === 'Home') {
+    nextIndex = 0;
+  } else if (event.key === 'End') {
+    nextIndex = tabButtons.length - 1;
+  } else {
+    return;
+  }
+
+  event.preventDefault();
+  const nextType = tabButtons[nextIndex].dataset.type;
+  if (nextType) {
+    tabButtons[nextIndex].focus();
+    switchStorageType(nextType);
+  }
+}
+
+/**
  * 初始化弹窗
  */
 async function initPopup() {
@@ -1024,16 +1674,18 @@ async function initPopup() {
   const stored = await chrome.storage.local.get([
     LAST_TYPE_STORAGE,
     LEGACY_LAST_VALUE_STORAGE,
+    AUTO_READ_SETTING,
     ...historyFields,
     ...lastKeyFields,
     ...lastValueFields,
   ]);
 
+  autoReadToggle.checked = stored[AUTO_READ_SETTING] !== false;
+
   const savedType = stored[LAST_TYPE_STORAGE];
   currentStorageType = Object.values(STORAGE_TYPES).includes(savedType) ? savedType : DEFAULT_STORAGE_TYPE;
   renderActiveTab();
 
-  // 迁移旧版共用 last-value 到当前类型字段
   const currentLastValueField = getLastValueField(currentStorageType);
   if (
     typeof stored[LEGACY_LAST_VALUE_STORAGE] === 'string' &&
@@ -1046,7 +1698,6 @@ async function initPopup() {
   }
 
   const historyList = await loadAndRenderKeyHistory();
-  // 默认取当前类型历史最新一条；无历史则留空显示 placeholder
   storageKeyInput.value = historyList[0] || '';
   syncClearKeyButton();
 
@@ -1054,6 +1705,7 @@ async function initPopup() {
     valueInput.value = stored[currentLastValueField];
   }
   autoResizeValueInput();
+  updateValueMeta();
 
   storageTypeTabsEl.addEventListener('click', (event) => {
     const target = event.target;
@@ -1066,8 +1718,46 @@ async function initPopup() {
     }
     switchStorageType(storageType);
   });
+  storageTypeTabsEl.addEventListener('keydown', handleTablistKeydown);
 
   clearHistoryBtn.addEventListener('click', clearAllKeyHistory);
+  browseKeysBtn.addEventListener('click', toggleKeysPanel);
+  refreshKeysBtn.addEventListener('click', async () => {
+    setStatus('刷新中...', '');
+    try {
+      await refreshPageKeys(true);
+      setStatus(`共 ${pageKeyCache.length} 个 key`, pageKeyCache.length ? 'success' : 'empty');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '刷新失败', 'error');
+    }
+  });
+  keysFilterInput.addEventListener('input', () => {
+    renderKeysList(keysFilterInput.value);
+  });
+  keysListEl.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+    const item = target.closest('.keys-item');
+    if (!(item instanceof HTMLElement) || !item.dataset.key) {
+      return;
+    }
+    try {
+      handleSelectHistoryKey(decodeURIComponent(item.dataset.key));
+    } catch {
+      handleSelectHistoryKey(item.dataset.key);
+    }
+  });
+
+  exportBtn.addEventListener('click', handleExport);
+  importBtn.addEventListener('click', () => importFileInput.click());
+  importFileInput.addEventListener('change', () => {
+    const file = importFileInput.files && importFileInput.files[0];
+    if (file) {
+      handleImportFile(file);
+    }
+  });
 
   historyRowEl.addEventListener('click', (event) => {
     const target = event.target;
@@ -1111,7 +1801,15 @@ async function initPopup() {
   clearKeyBtn.addEventListener('click', handleClearKey);
   formatJsonBtn.addEventListener('click', handleFormatJson);
   compressJsonBtn.addEventListener('click', handleCompressJson);
-  valueInput.addEventListener('input', autoResizeValueInput);
+  valueInput.addEventListener('input', () => {
+    autoResizeValueInput();
+    updateValueMeta();
+  });
+
+  autoReadToggle.addEventListener('change', () => {
+    chrome.storage.local.set({ [AUTO_READ_SETTING]: autoReadToggle.checked });
+    setStatus(autoReadToggle.checked ? '已开启打开自动读取' : '已关闭打开自动读取', 'success');
+  });
 
   cookieSameSiteSelect.addEventListener('change', () => {
     if (cookieSameSiteSelect.value === 'None') {
@@ -1119,8 +1817,63 @@ async function initPopup() {
     }
   });
 
-  storageKeyInput.addEventListener('input', syncClearKeyButton);
+  storageKeyInput.addEventListener('input', () => {
+    syncClearKeyButton();
+    updateKeySuggest(true);
+  });
+  storageKeyInput.addEventListener('focus', () => {
+    updateKeySuggest(true);
+  });
+  storageKeyInput.addEventListener('blur', () => {
+    suggestBlurTimer = setTimeout(() => {
+      hideKeySuggest();
+    }, 150);
+  });
+  keySuggestListEl.addEventListener('mousedown', (event) => {
+    event.preventDefault();
+    if (suggestBlurTimer) {
+      clearTimeout(suggestBlurTimer);
+      suggestBlurTimer = null;
+    }
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+    const item = target.closest('.key-suggest-item');
+    if (!(item instanceof HTMLElement)) {
+      return;
+    }
+    const index = Number(item.dataset.index);
+    if (Number.isFinite(index)) {
+      selectSuggestItem(index);
+    }
+  });
+
   storageKeyInput.addEventListener('keydown', (event) => {
+    if (!keySuggestListEl.hidden && suggestItems.length) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        suggestActiveIndex = (suggestActiveIndex + 1) % suggestItems.length;
+        renderKeySuggest();
+        return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        suggestActiveIndex = (suggestActiveIndex - 1 + suggestItems.length) % suggestItems.length;
+        renderKeySuggest();
+        return;
+      }
+      if (event.key === 'Escape') {
+        hideKeySuggest();
+        return;
+      }
+      if (event.key === 'Enter' && !event.metaKey && !event.ctrlKey && suggestActiveIndex >= 0) {
+        event.preventDefault();
+        selectSuggestItem(suggestActiveIndex);
+        return;
+      }
+    }
+
     if (isSubmitShortcut(event)) {
       event.preventDefault();
       handleWrite();
@@ -1145,9 +1898,12 @@ async function initPopup() {
     }
   });
 
-  // 有历史 key 时默认读取；无历史则留空展示 placeholder
-  if (storageKeyInput.value.trim()) {
+  refreshPageKeys(false).catch(() => {});
+
+  if (storageKeyInput.value.trim() && isAutoReadEnabled()) {
     await handleRead();
+  } else if (storageKeyInput.value.trim()) {
+    setStatus('已关闭自动读取，可手动点击读取', '');
   }
 }
 
