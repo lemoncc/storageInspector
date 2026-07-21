@@ -87,6 +87,7 @@
             全部 Key
           </button>
         </div>
+        <p id="statusText" class="status" role="status" aria-live="polite"></p>
 
         <div class="history-panel" id="historyPanel" hidden>
           <div class="history-toolbar">
@@ -170,7 +171,7 @@
         <div class="result-header">
           <label class="label" for="valueInput">值（可粘贴后写入）</label>
           <div class="result-actions">
-            <button id="formatJsonBtn" class="btn btn-ghost" type="button">格式化</button>
+            <button id="formatJsonBtn" class="btn btn-ghost" type="button">递归格式化</button>
             <button id="compressJsonBtn" class="btn btn-ghost" type="button">压缩</button>
             <button id="pasteBtn" class="btn btn-ghost" type="button">粘贴</button>
             <button id="copyBtn" class="btn btn-ghost" type="button">复制</button>
@@ -191,7 +192,6 @@
           <button id="writeBtn" class="btn btn-success" type="button">写入</button>
           <button id="deleteBtn" class="btn btn-danger" type="button">删除</button>
         </div>
-        <p id="statusText" class="status"></p>
       </section>
     </div>
 

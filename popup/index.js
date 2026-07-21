@@ -290,10 +290,11 @@ function writePageStorageBatch(storageType, entries, cookieOptions = {}) {
           failCount += 1;
         }
       } else {
-        const path = cookieOptions.path || '/';
-        const domain = typeof cookieOptions.domain === 'string' ? cookieOptions.domain.trim() : '';
-        let sameSite = typeof cookieOptions.sameSite === 'string' ? cookieOptions.sameSite : '';
-        let secure = Boolean(cookieOptions.secure);
+        const options = cookieOptions || {};
+        const path = options.path || '/';
+        const domain = typeof options.domain === 'string' ? options.domain.trim() : '';
+        let sameSite = typeof options.sameSite === 'string' ? options.sameSite : '';
+        let secure = Boolean(options.secure);
         if (sameSite === 'None') {
           secure = true;
         }
@@ -302,11 +303,11 @@ function writePageStorageBatch(storageType, entries, cookieOptions = {}) {
           parts.push(`domain=${domain}`);
         }
         if (
-          cookieOptions.maxAge !== null &&
-          cookieOptions.maxAge !== undefined &&
-          Number.isFinite(cookieOptions.maxAge)
+          options.maxAge !== null &&
+          options.maxAge !== undefined &&
+          Number.isFinite(options.maxAge)
         ) {
-          parts.push(`Max-Age=${Math.floor(cookieOptions.maxAge)}`);
+          parts.push(`Max-Age=${Math.floor(options.maxAge)}`);
         }
         if (sameSite) {
           parts.push(`SameSite=${sameSite}`);
@@ -379,10 +380,11 @@ function writePageStorage(storageType, key, value, cookieOptions = {}) {
     return { ...routeInfo, value: readValue, success: readValue === value };
   }
 
-  const path = cookieOptions.path || '/';
-  const domain = typeof cookieOptions.domain === 'string' ? cookieOptions.domain.trim() : '';
-  let sameSite = typeof cookieOptions.sameSite === 'string' ? cookieOptions.sameSite : '';
-  let secure = Boolean(cookieOptions.secure);
+  const options = cookieOptions || {};
+  const path = options.path || '/';
+  const domain = typeof options.domain === 'string' ? options.domain.trim() : '';
+  let sameSite = typeof options.sameSite === 'string' ? options.sameSite : '';
+  let secure = Boolean(options.secure);
   if (sameSite === 'None') {
     secure = true;
   }
@@ -391,8 +393,8 @@ function writePageStorage(storageType, key, value, cookieOptions = {}) {
   if (domain) {
     parts.push(`domain=${domain}`);
   }
-  if (cookieOptions.maxAge !== null && cookieOptions.maxAge !== undefined && Number.isFinite(cookieOptions.maxAge)) {
-    parts.push(`Max-Age=${Math.floor(cookieOptions.maxAge)}`);
+  if (options.maxAge !== null && options.maxAge !== undefined && Number.isFinite(options.maxAge)) {
+    parts.push(`Max-Age=${Math.floor(options.maxAge)}`);
   }
   if (sameSite) {
     parts.push(`SameSite=${sameSite}`);
@@ -407,7 +409,7 @@ function writePageStorage(storageType, key, value, cookieOptions = {}) {
     ...routeInfo,
     value: readValue,
     success: readValue === value,
-    cookieMeta: { path, domain, secure, sameSite, maxAge: cookieOptions.maxAge ?? null },
+    cookieMeta: { path, domain, secure, sameSite, maxAge: options.maxAge ?? null },
   };
 }
 
@@ -458,8 +460,9 @@ function deletePageStorage(storageType, key, cookieOptions = {}) {
     return { ...routeInfo, success: window.sessionStorage.getItem(key) === null };
   }
 
-  const path = cookieOptions.path || '/';
-  const domain = typeof cookieOptions.domain === 'string' ? cookieOptions.domain.trim() : '';
+  const options = cookieOptions || {};
+  const path = options.path || '/';
+  const domain = typeof options.domain === 'string' ? options.domain.trim() : '';
   const parts = [`${encodeURIComponent(key)}=`, `path=${path}`, 'Max-Age=0'];
   if (domain) {
     parts.push(`domain=${domain}`);
@@ -518,10 +521,13 @@ function assertInjectableTab(tab) {
  * @returns {Promise<T>}
  */
 async function executeInTab(tabId, func, args = []) {
+  // chrome.scripting.executeScript 的 args 不能包含 undefined（会报 Value is unserializable）
+  const serializableArgs = args.map((arg) => (arg === undefined ? null : arg));
+
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func,
-    args,
+    args: serializableArgs,
   });
 
   if (!results || !results[0]) {
@@ -1135,10 +1141,13 @@ async function readStorageValue(tab, storageType, key) {
  * @param {ReturnType<typeof getCookieWriteOptions>} [cookieOptions]
  */
 async function writeStorageValue(tab, storageType, key, value, cookieOptions) {
+  // textarea 取值始终按字符串写入，避免异常类型
+  const textValue = value == null ? '' : String(value);
+
   if (storageType === STORAGE_TYPES.cookie) {
-    return writeCookieViaApi(tab, key, value, cookieOptions || getCookieWriteOptions());
+    return writeCookieViaApi(tab, key, textValue, cookieOptions || getCookieWriteOptions());
   }
-  return executeInTab(tab.id, writePageStorage, [storageType, key, value, cookieOptions]);
+  return executeInTab(tab.id, writePageStorage, [storageType, key, textValue, cookieOptions ?? null]);
 }
 
 /**
@@ -1152,7 +1161,7 @@ async function deleteStorageValue(tab, storageType, key, cookieOptions) {
   if (storageType === STORAGE_TYPES.cookie) {
     return deleteCookieViaApi(tab, key, cookieOptions);
   }
-  return executeInTab(tab.id, deletePageStorage, [storageType, key, cookieOptions]);
+  return executeInTab(tab.id, deletePageStorage, [storageType, key, cookieOptions ?? null]);
 }
 
 /**
@@ -1212,9 +1221,27 @@ function truncateText(text, limit = DIFF_PREVIEW_LIMIT) {
  * @param {string} text
  * @param {'success' | 'error' | 'empty' | ''} type
  */
+/**
+ * 设置状态文案（展示在读取按钮下方，便于立即看到结果）
+ * @param {string} text
+ * @param {'success' | 'error' | 'empty' | 'pending' | ''} type
+ */
 function setStatus(text, type = '') {
+  const nextType = type || (text ? 'pending' : '');
   statusTextEl.textContent = text;
-  statusTextEl.className = `status${type ? ` is-${type}` : ''}`;
+  statusTextEl.className = `status${nextType ? ` is-${nextType}` : ''}`;
+
+  if (!text) {
+    return;
+  }
+
+  if (nextType === 'error' || nextType === 'empty' || nextType === 'success') {
+    statusTextEl.classList.remove('is-flash');
+    // 触发重绘以重启动画
+    void statusTextEl.offsetWidth;
+    statusTextEl.classList.add('is-flash');
+    statusTextEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
 }
 
 /**
@@ -1926,11 +1953,13 @@ async function handleRead() {
       valueInput.value = '';
       autoResizeValueInput();
       updateValueMeta();
+      clearNestedStringRestoreMap();
       setStatus(`key "${key}" 不存在`, 'empty');
     } else {
       valueInput.value = pageData.value;
       autoResizeValueInput();
       updateValueMeta();
+      clearNestedStringRestoreMap();
       await saveLastValue(pageData.value);
       const byteLength = new TextEncoder().encode(pageData.value).length;
       const httpOnlyTip = pageData.httpOnly ? ' · HttpOnly' : '';
@@ -2262,7 +2291,7 @@ async function handleImportFile(file) {
       result = await executeInTab(tab.id, writePageStorageBatch, [
         currentStorageType,
         entries,
-        cookieOptions,
+        cookieOptions ?? null,
       ]);
     }
     renderRouteInfo(result);
@@ -2313,6 +2342,7 @@ async function handlePaste() {
     valueInput.value = text;
     autoResizeValueInput();
     updateValueMeta();
+    clearNestedStringRestoreMap();
     setStatus(`已粘贴，长度 ${text.length}，可点击「写入」`, 'success');
     valueInput.focus();
   } catch {
@@ -2322,7 +2352,326 @@ async function handlePaste() {
 }
 
 /**
- * 格式化 JSON
+ * 宽松解析对象/数组文本（兼容尾逗号、JS 对象字面量）
+ * @param {string} text
+ * @returns {any}
+ */
+function parseStructuredData(text) {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // continue
+  }
+
+  // 去掉尾逗号后再试
+  try {
+    const withoutTrailingComma = trimmed.replace(/,\s*([\]}])/g, '$1');
+    return JSON.parse(withoutTrailingComma);
+  } catch {
+    // continue
+  }
+
+  // 按 JS 表达式解析（兼容未加引号 key、单引号等）
+  try {
+    const result = new Function(`"use strict"; return (${trimmed});`)();
+    if (result !== null && typeof result === 'object') {
+      return result;
+    }
+  } catch {
+    // continue
+  }
+
+  return null;
+}
+
+/**
+ * 若字符串仍含 JSON 转义形态（\" \\n），先解码一层
+ * @param {string} text
+ * @returns {string}
+ */
+function decodeEscapedTextLayer(text) {
+  if (!text.includes('\\n') && !text.includes('\\"') && !text.includes('\\t')) {
+    return text;
+  }
+
+  try {
+    // text 本身已是 JSON 字符串的「内容转义形态」
+    return JSON.parse(`"${text}"`);
+  } catch {
+    return text;
+  }
+}
+
+/**
+ * 从 start 起截取平衡的 {} 或 [] 片段
+ * @param {string} text
+ * @param {number} start
+ * @returns {string | null}
+ */
+function sliceBalancedFragment(text, start) {
+  const openChar = text[start];
+  if (openChar !== '{' && openChar !== '[') {
+    return null;
+  }
+  const closeChar = openChar === '{' ? '}' : ']';
+  let depth = 0;
+  let inString = false;
+  let stringQuote = '';
+  let escaped = false;
+
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (char === stringQuote) {
+        inString = false;
+        stringQuote = '';
+      }
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      inString = true;
+      stringQuote = char;
+      continue;
+    }
+
+    if (char === openChar) {
+      depth += 1;
+      continue;
+    }
+    if (char === closeChar) {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(start, index + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * 提取文本中可解析的嵌入对象/数组（支持 jsCode: 注释 + var config = {...}）
+ * @param {string} text
+ * @returns {{ prefix: string, jsonText: string, suffix: string, parsed: any } | null}
+ */
+function extractBalancedJsonFragment(text) {
+  const sourceText = decodeEscapedTextLayer(text);
+  const startIndexes = [];
+
+  for (let index = 0; index < sourceText.length; index += 1) {
+    const char = sourceText[index];
+    if (char === '{' || char === '[') {
+      startIndexes.push(index);
+    }
+  }
+
+  for (const start of startIndexes) {
+    const jsonText = sliceBalancedFragment(sourceText, start);
+    if (!jsonText) {
+      continue;
+    }
+    const parsed = parseStructuredData(jsonText);
+    if (parsed === null || typeof parsed !== 'object') {
+      continue;
+    }
+    return {
+      prefix: sourceText.slice(0, start),
+      jsonText,
+      suffix: sourceText.slice(start + jsonText.length),
+      parsed,
+    };
+  }
+
+  // 兼容 var config = {...}; / let/const config = {...}
+  const assignMatch = sourceText.match(
+    /(?:var|let|const)\s+[A-Za-z_$][\w$]*\s*=\s*(\{[\s\S]*\}|\[[\s\S]*\])\s*;?\s*$/
+  );
+  if (assignMatch && assignMatch.index != null) {
+    const jsonText = assignMatch[1];
+    const parsed = parseStructuredData(jsonText);
+    if (parsed !== null && typeof parsed === 'object') {
+      const start = assignMatch.index + assignMatch[0].lastIndexOf(jsonText);
+      return {
+        prefix: sourceText.slice(0, start),
+        jsonText,
+        suffix: sourceText.slice(start + jsonText.length),
+        parsed,
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * 递归格式化时记录：路径 -> 展开前的原始字符串
+ * 压缩时一律按原文还原，避免函数字段被 JSON.stringify 丢弃或空白被改写
+ * @type {Map<string, string>}
+ */
+let nestedStringRestoreMap = new Map();
+
+/**
+ * 清空嵌套字符串还原表
+ */
+function clearNestedStringRestoreMap() {
+  nestedStringRestoreMap.clear();
+}
+
+/**
+ * 拼接 JSON 路径
+ * @param {string} basePath
+ * @param {string | number} key
+ * @returns {string}
+ */
+function joinJsonPath(basePath, key) {
+  if (!basePath) {
+    return String(key);
+  }
+  return `${basePath}.${key}`;
+}
+
+/**
+ * 展示用序列化：函数转成源码字符串，避免被 JSON.stringify 直接丢掉
+ * @param {any} value
+ * @param {number} [space]
+ * @returns {string}
+ */
+function stringifyForDisplay(value, space = 2) {
+  return JSON.stringify(
+    value,
+    (_key, nestedValue) => {
+      if (typeof nestedValue === 'function') {
+        return nestedValue.toString();
+      }
+      if (typeof nestedValue === 'undefined') {
+        return null;
+      }
+      return nestedValue;
+    },
+    space
+  );
+}
+
+/**
+ * 记录嵌套字符串原文，并返回继续递归的解析结果
+ * @param {string} path
+ * @param {string} original
+ * @param {any} parsed
+ * @param {{ expandedCount: number }} counter
+ * @param {number} depth
+ * @returns {any}
+ */
+function registerNestedStringExpansion(path, original, parsed, counter, depth) {
+  counter.expandedCount += 1;
+  nestedStringRestoreMap.set(path, original);
+  return deepFormatJsonValue(parsed, counter, path, depth + 1);
+}
+
+/**
+ * 递归格式化：将可解析的嵌套字符串展开为对象，便于阅读；并记录原文以便压缩还原
+ * @param {any} value
+ * @param {{ expandedCount: number }} counter
+ * @param {string} [path]
+ * @param {number} [depth]
+ * @returns {any}
+ */
+function deepFormatJsonValue(value, counter, path = '', depth = 0) {
+  if (depth > 30) {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item, index) =>
+      deepFormatJsonValue(item, counter, joinJsonPath(path, index), depth + 1)
+    );
+  }
+
+  if (value && typeof value === 'object') {
+    /** @type {Record<string, any>} */
+    const result = {};
+    Object.entries(value).forEach(([key, child]) => {
+      result[key] = deepFormatJsonValue(child, counter, joinJsonPath(path, key), depth + 1);
+    });
+    return result;
+  }
+
+  if (typeof value !== 'string') {
+    return value;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return value;
+  }
+
+  // 整段就是 JSON / JS 对象字符串 → 展开为对象
+  const directParsed = parseStructuredData(trimmed);
+  if (directParsed !== null && typeof directParsed === 'object') {
+    return registerNestedStringExpansion(path, value, directParsed, counter, depth);
+  }
+
+  // jsCode：注释/赋值 + 对象 → 展开对象，记住原文
+  const fragment = extractBalancedJsonFragment(value);
+  if (!fragment || fragment.parsed === null || typeof fragment.parsed !== 'object') {
+    return value;
+  }
+
+  return registerNestedStringExpansion(path, value, fragment.parsed, counter, depth);
+}
+
+/**
+ * 压缩前还原：已展开的嵌套路径直接回写格式化前的原文
+ * @param {any} value
+ * @param {{ restoredCount: number }} counter
+ * @param {string} [path]
+ * @param {number} [depth]
+ * @returns {any}
+ */
+function deepRestoreJsonValue(value, counter, path = '', depth = 0) {
+  if (depth > 30) {
+    return value;
+  }
+
+  if (nestedStringRestoreMap.has(path)) {
+    counter.restoredCount += 1;
+    return nestedStringRestoreMap.get(path);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item, index) =>
+      deepRestoreJsonValue(item, counter, joinJsonPath(path, index), depth + 1)
+    );
+  }
+
+  if (value && typeof value === 'object') {
+    /** @type {Record<string, any>} */
+    const result = {};
+    Object.entries(value).forEach(([key, child]) => {
+      result[key] = deepRestoreJsonValue(child, counter, joinJsonPath(path, key), depth + 1);
+    });
+    return result;
+  }
+
+  return value;
+}
+
+/**
+ * 格式化 JSON：解析嵌套字符串为对象（可读），压缩时可还原
  */
 function handleFormatJson() {
   const text = valueInput.value.trim();
@@ -2332,17 +2681,29 @@ function handleFormatJson() {
   }
 
   try {
-    valueInput.value = JSON.stringify(JSON.parse(text), null, 2);
+    const parsed = JSON.parse(text);
+    clearNestedStringRestoreMap();
+    const counter = { expandedCount: 0 };
+    const formatted = deepFormatJsonValue(parsed, counter);
+    // 用展示序列化，避免箭头函数等被普通 JSON.stringify 丢弃
+    valueInput.value = stringifyForDisplay(formatted, 2);
     autoResizeValueInput();
     updateValueMeta();
-    setStatus('已格式化 JSON', 'success');
+    if (counter.expandedCount > 0) {
+      setStatus(
+        `已递归格式化（解析 ${counter.expandedCount} 处嵌套对象；压缩时按原文还原，可安全写入）`,
+        'success'
+      );
+    } else {
+      setStatus('已格式化 JSON', 'success');
+    }
   } catch {
     setStatus('不是合法 JSON，无法格式化', 'error');
   }
 }
 
 /**
- * 压缩 JSON
+ * 压缩 JSON：若有格式化还原表，先还原嵌套字符串再压缩
  */
 function handleCompressJson() {
   const text = valueInput.value.trim();
@@ -2352,10 +2713,19 @@ function handleCompressJson() {
   }
 
   try {
-    valueInput.value = JSON.stringify(JSON.parse(text));
+    const parsed = JSON.parse(text);
+    const counter = { restoredCount: 0 };
+    const restored =
+      nestedStringRestoreMap.size > 0 ? deepRestoreJsonValue(parsed, counter) : parsed;
+    valueInput.value = JSON.stringify(restored);
     autoResizeValueInput();
     updateValueMeta();
-    setStatus('已压缩 JSON', 'success');
+    clearNestedStringRestoreMap();
+    if (counter.restoredCount > 0) {
+      setStatus(`已压缩并还原 ${counter.restoredCount} 处嵌套字符串，可安全写入`, 'success');
+    } else {
+      setStatus('已压缩 JSON', 'success');
+    }
   } catch {
     setStatus('不是合法 JSON，无法压缩', 'error');
   }
@@ -2388,6 +2758,7 @@ function handleClear() {
   valueInput.value = '';
   autoResizeValueInput();
   updateValueMeta();
+  clearNestedStringRestoreMap();
   setStatus('已清空', '');
   valueInput.focus();
 }
