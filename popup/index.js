@@ -1179,6 +1179,36 @@ async function writeCookieViaApi(tab, key, value, options, conflictMode = 'repla
 }
 
 /**
+ * 按表单 Path/Domain 筛选待删 cookie（同名多 Path 时只删当前目标）
+ * @param {chrome.cookies.Cookie[]} cookies
+ * @param {{ path?: string, domain?: string }} options
+ * @returns {chrome.cookies.Cookie[]}
+ */
+function filterCookiesByDeleteOptions(cookies, options = {}) {
+  const optPath = options.path || '/';
+  const optDomainNorm =
+    typeof options.domain === 'string' ? options.domain.trim().replace(/^\./, '') : '';
+
+  const samePath = cookies.filter((cookie) => (cookie.path || '/') === optPath);
+  if (!samePath.length) {
+    return [];
+  }
+
+  if (optDomainNorm) {
+    return samePath.filter((cookie) => {
+      const cookieDomainNorm = cookie.hostOnly
+        ? ''
+        : String(cookie.domain || '').replace(/^\./, '');
+      return cookieDomainNorm === optDomainNorm;
+    });
+  }
+
+  // Domain 为空：优先 host-only（与读取回填一致）；否则同 Path 全部
+  const hostOnlyMatches = samePath.filter((cookie) => cookie.hostOnly);
+  return hostOnlyMatches.length ? hostOnlyMatches : samePath;
+}
+
+/**
  * 通过 chrome.cookies 删除 cookie（含 HttpOnly）
  * @param {chrome.tabs.Tab} tab
  * @param {string} key
@@ -1189,16 +1219,42 @@ async function deleteCookieViaApi(tab, key, options = {}) {
   await ensureCookieHostPermission(tab.url || '');
 
   const matchedCookies = (await collectTabCookies(tab)).filter((cookie) => cookie.name === key);
-  const cached = cookieDetailCache[key];
-  const targets = matchedCookies.length ? matchedCookies : cached ? [cached] : [];
+  // 缓存 key 为 name+path+domain 复合键，不能直接用 name 取值
+  const cachedByName = Object.values(cookieDetailCache).filter((cookie) => cookie?.name === key);
+  const allSameName = matchedCookies.length ? matchedCookies : cachedByName;
+  // 有 Path/Domain 时只删匹配项，避免误删同名其他 Path
+  const hasDeleteHint =
+    (typeof options.path === 'string' && options.path.trim() !== '') ||
+    (typeof options.domain === 'string' && options.domain.trim() !== '');
+  const targets = hasDeleteHint
+    ? filterCookiesByDeleteOptions(allSameName, options)
+    : allSameName;
+
+  // 同名存在但 Path/Domain 对不上：直接失败，提示用户调整表单
+  if (hasDeleteHint && !targets.length && allSameName.length) {
+    return { ...routeInfo, success: false };
+  }
 
   if (!targets.length) {
     const storeId = tab.id ? await getTabCookieStoreId(tab.id) : undefined;
-    await chrome.cookies.remove({
-      url: normalizeCookieQueryUrl(tab.url || ''),
-      name: key,
-      ...(storeId ? { storeId } : {}),
-    });
+    const path = options.path || '/';
+    try {
+      const parsed = new URL(tab.url || '');
+      const domain = (options.domain || parsed.hostname).replace(/^\./, '');
+      for (const protocol of ['https:', 'http:']) {
+        await chrome.cookies.remove({
+          url: `${protocol}//${domain}${path}`,
+          name: key,
+          ...(storeId ? { storeId } : {}),
+        });
+      }
+    } catch {
+      await chrome.cookies.remove({
+        url: normalizeCookieQueryUrl(tab.url || ''),
+        name: key,
+        ...(storeId ? { storeId } : {}),
+      });
+    }
   } else {
     for (const cookie of targets) {
       await chrome.cookies.remove({
@@ -1209,9 +1265,14 @@ async function deleteCookieViaApi(tab, key, options = {}) {
     }
   }
 
-  const remainAfter = (await collectTabCookies(tab)).filter((cookie) => cookie.name === key);
-  if (remainAfter.length) {
-    for (const cookie of remainAfter) {
+  // 仅检查「本次目标」是否删干净，同名其他 Path 允许保留
+  const remainSameName = (await collectTabCookies(tab)).filter((cookie) => cookie.name === key);
+  const remainTargets = hasDeleteHint
+    ? filterCookiesByDeleteOptions(remainSameName, options)
+    : remainSameName;
+
+  if (remainTargets.length) {
+    for (const cookie of remainTargets) {
       await chrome.cookies.remove({
         url: buildCookieUrl(cookie, tab),
         name: key,
@@ -1220,28 +1281,18 @@ async function deleteCookieViaApi(tab, key, options = {}) {
     }
   }
 
-  if (options.path || options.domain) {
-    try {
-      const parsed = new URL(tab.url || '');
-      const domain = (options.domain || parsed.hostname).replace(/^\./, '');
-      const path = options.path || '/';
-      const storeId = tab.id ? await getTabCookieStoreId(tab.id) : undefined;
-      for (const protocol of ['https:', 'http:']) {
-        await chrome.cookies.remove({
-          url: `${protocol}//${domain}${path}`,
-          name: key,
-          ...(storeId ? { storeId } : {}),
-        });
-      }
-    } catch {
-      // 忽略兜底失败
-    }
-  }
+  const remainFinalSameName = (await collectTabCookies(tab)).filter((cookie) => cookie.name === key);
+  const remainFinal = hasDeleteHint
+    ? filterCookiesByDeleteOptions(remainFinalSameName, options)
+    : remainFinalSameName;
 
-  const remainFinal = (await collectTabCookies(tab)).filter((cookie) => cookie.name === key);
   if (!remainFinal.length) {
     Object.keys(cookieDetailCache).forEach((cacheKey) => {
-      if (cookieDetailCache[cacheKey]?.name === key) {
+      const cached = cookieDetailCache[cacheKey];
+      if (!cached || cached.name !== key) {
+        return;
+      }
+      if (!hasDeleteHint || filterCookiesByDeleteOptions([cached], options).length) {
         delete cookieDetailCache[cacheKey];
       }
     });
@@ -2173,6 +2224,8 @@ async function switchStorageType(storageType) {
   invalidatePageKeysCache();
   clearCookiePreservedExpiration();
   cookieMaxAgeInput.value = '';
+  // 切换类型会换掉当前值，格式化展开态不可跨类型沿用
+  clearFormatRestoreState();
 
   const historyList = await loadAndRenderKeyHistory();
   storageKeyInput.value = historyList[0] || '';
@@ -2396,12 +2449,10 @@ async function handleWrite() {
     return;
   }
 
-  // 写入前始终做还原 + 压缩，避免展开态/缩进态直接入库
+  // 写入前计算还原 + 压缩结果；确认前不改动文本框，避免取消后丢展开态/二次还原损坏
   const prepared = prepareValueForWrite(valueInput.value);
-  let value = prepared.text;
-  valueInput.value = value;
-  autoResizeValueInput();
-  updateValueMeta();
+  const value = prepared.text;
+  const keptEditsOnWrite = formatExpandDirty && prepared.restoredCount > 0;
 
   try {
     const tab = await getActiveTab();
@@ -2432,7 +2483,6 @@ async function handleWrite() {
     }
 
     setBusy(true);
-    const keptEditsOnWrite = formatExpandDirty && prepared.restoredCount > 0;
     if (prepared.usedFallback) {
       setActionStatus('已回退格式化前原文并压缩，写入中...');
     } else if (keptEditsOnWrite) {
@@ -2580,7 +2630,7 @@ async function handleDelete() {
     if (!pageData.success) {
       const failTip =
         currentStorageType === STORAGE_TYPES.cookie
-          ? '删除失败：cookie 仍存在。可尝试修改 Path/Domain 后再删'
+          ? '删除失败：未删掉匹配的 cookie。请确认上方 Path/Domain（同名多 Path 时需精确匹配），或从「全部 Key」点选后再删'
           : '删除失败：key 仍存在';
       setActionStatus(failTip, 'error');
       return;
@@ -2589,6 +2639,7 @@ async function handleDelete() {
     valueInput.value = '';
     autoResizeValueInput();
     updateValueMeta();
+    clearNestedStringRestoreMap();
     if (currentStorageType === STORAGE_TYPES.cookie) {
       clearCookiePreservedExpiration();
       cookieMaxAgeInput.value = '';
@@ -3252,6 +3303,10 @@ function deepRestoreJsonValue(value, counter, path = '', depth = 0) {
 
   if (meta && formatExpandDirty) {
     counter.restoredCount += 1;
+    // 已是字符串说明该层已折叠（例如取消写入后残留），禁止再次 stringify 造成双重转义
+    if (typeof nextValue === 'string') {
+      return nextValue;
+    }
     return `${meta.prefix}${JSON.stringify(nextValue)}${meta.suffix}`;
   }
 
@@ -3577,6 +3632,14 @@ async function initPopup() {
   clearKeyBtn.addEventListener('click', handleClearKey);
   formatJsonBtn.addEventListener('click', handleFormatJson);
   compressJsonBtn.addEventListener('click', handleCompressJson);
+  valueInput.addEventListener('paste', () => {
+    // 全选粘贴视为换新内容，清掉展开态，避免用旧还原表误折叠
+    const allSelected =
+      valueInput.selectionStart === 0 && valueInput.selectionEnd === valueInput.value.length;
+    if (formatExpandActive && (allSelected || !valueInput.value)) {
+      clearFormatRestoreState();
+    }
+  });
   valueInput.addEventListener('input', () => {
     // 格式化展开后一旦改动，压缩/写入按当前内容重序列化，保留内层修改
     if (formatExpandActive) {
