@@ -44,6 +44,7 @@ const clearKeyBtn = document.getElementById('clearKeyBtn');
 const formatJsonBtn = document.getElementById('formatJsonBtn');
 const compressJsonBtn = document.getElementById('compressJsonBtn');
 const browseKeysBtn = document.getElementById('browseKeysBtn');
+const toggleHistoryBtn = document.getElementById('toggleHistoryBtn');
 const routeSectionEl = document.getElementById('routeSection');
 const routeToggleBtn = document.getElementById('routeToggleBtn');
 const routeInfoEl = document.getElementById('routeInfo');
@@ -51,6 +52,7 @@ const statusTextEl = document.getElementById('statusText');
 const storageTypeTabsEl = document.getElementById('storageTypeTabs');
 const historyPanelEl = document.getElementById('historyPanel');
 const historyRowEl = document.getElementById('historyRow');
+const historyEmptyTipEl = document.getElementById('historyEmptyTip');
 const clearHistoryBtn = document.getElementById('clearHistoryBtn');
 const cookieOptionsEl = document.getElementById('cookieOptions');
 const cookiePathInput = document.getElementById('cookiePath');
@@ -58,6 +60,7 @@ const cookieMaxAgeInput = document.getElementById('cookieMaxAge');
 const cookieDomainInput = document.getElementById('cookieDomain');
 const cookieSameSiteSelect = document.getElementById('cookieSameSite');
 const cookieSecureCheckbox = document.getElementById('cookieSecure');
+const cookieHttpOnlyCheckbox = document.getElementById('cookieHttpOnly');
 const autoReadToggle = document.getElementById('autoReadToggle');
 const keySuggestListEl = document.getElementById('keySuggestList');
 const keysPanelEl = document.getElementById('keysPanel');
@@ -79,12 +82,16 @@ const confirmOkBtn = document.getElementById('confirmOkBtn');
 let currentStorageType = DEFAULT_STORAGE_TYPE;
 /** 读写/删除互斥锁 */
 let isBusy = false;
+/** 历史面板是否展开（默认关闭） */
+let isHistoryPanelOpen = false;
 /** @type {string[]} */
 let historyKeyCache = [];
 /** @type {string[]} */
 let pageKeyCache = [];
 /** @type {Record<string, string>} */
 let pageEntriesCache = {};
+/** @type {Record<string, chrome.cookies.Cookie>} */
+let cookieDetailCache = {};
 /** @type {Array<{ key: string, source: string }>} */
 let suggestItems = [];
 let suggestActiveIndex = -1;
@@ -526,6 +533,626 @@ async function executeInTab(tabId, func, args = []) {
 }
 
 /**
+ * 从 tab.url 构造路由信息
+ * @param {chrome.tabs.Tab} tab
+ */
+function buildRouteInfoFromTab(tab) {
+  try {
+    const parsedUrl = new URL(tab.url || '');
+    return {
+      href: tab.url || '',
+      hash: parsedUrl.hash,
+      pathname: parsedUrl.pathname,
+      origin: parsedUrl.origin,
+    };
+  } catch {
+    return {
+      href: tab.url || '',
+      hash: '',
+      pathname: '',
+      origin: '',
+    };
+  }
+}
+
+/**
+ * SameSite 表单值 -> chrome.cookies API
+ * @param {string} sameSite
+ * @returns {chrome.cookies.SameSiteStatus | undefined}
+ */
+function mapSameSiteToApi(sameSite) {
+  if (sameSite === 'Lax') {
+    return 'lax';
+  }
+  if (sameSite === 'Strict') {
+    return 'strict';
+  }
+  if (sameSite === 'None') {
+    return 'no_restriction';
+  }
+  return undefined;
+}
+
+/**
+ * chrome.cookies SameSite -> 表单值
+ * @param {string | undefined} sameSite
+ * @returns {string}
+ */
+function mapSameSiteFromApi(sameSite) {
+  if (sameSite === 'lax') {
+    return 'Lax';
+  }
+  if (sameSite === 'strict') {
+    return 'Strict';
+  }
+  if (sameSite === 'no_restriction') {
+    return 'None';
+  }
+  return '';
+}
+
+/**
+ * 根据 cookie 详情构造可用于 remove/set 的 URL
+ * @param {chrome.cookies.Cookie} cookie
+ * @param {chrome.tabs.Tab} tab
+ * @returns {string}
+ */
+function buildCookieUrl(cookie, tab) {
+  try {
+    const tabUrl = new URL(tab.url || 'https://example.com');
+    const protocol = cookie.secure ? 'https:' : tabUrl.protocol;
+    const rawDomain = cookie.domain || tabUrl.hostname;
+    const domain = rawDomain.startsWith('.') ? rawDomain.slice(1) : rawDomain;
+    const path = cookie.path || '/';
+    return `${protocol}//${domain}${path}`;
+  } catch {
+    return tab.url || '';
+  }
+}
+
+/**
+ * 将 cookie 详情回填到表单
+ * @param {chrome.cookies.Cookie} cookie
+ */
+function applyCookieDetailsToForm(cookie) {
+  cookiePathInput.value = cookie.path || '/';
+  cookieDomainInput.value = cookie.hostOnly ? '' : cookie.domain || '';
+  cookieSecureCheckbox.checked = Boolean(cookie.secure);
+  cookieHttpOnlyCheckbox.checked = Boolean(cookie.httpOnly);
+  cookieSameSiteSelect.value = mapSameSiteFromApi(cookie.sameSite);
+  if (cookie.session || !cookie.expirationDate) {
+    cookieMaxAgeInput.value = '';
+  } else {
+    const remainSeconds = Math.max(0, Math.floor(cookie.expirationDate - Date.now() / 1000));
+    cookieMaxAgeInput.value = String(remainSeconds);
+  }
+}
+
+/**
+ * 规范化用于 cookie 查询的 URL（去掉 hash，避免匹配失败）
+ * @param {string} tabUrl
+ * @returns {string}
+ */
+function normalizeCookieQueryUrl(tabUrl) {
+  const parsedUrl = new URL(tabUrl);
+  return `${parsedUrl.origin}${parsedUrl.pathname || '/'}`;
+}
+
+/**
+ * 拆出当前路径及所有父级前缀（用于覆盖子路由 Path）
+ * @param {string} pathname
+ * @returns {string[]}
+ */
+function getPathPrefixes(pathname) {
+  const rawPath = pathname || '/';
+  const normalized =
+    rawPath.length > 1 && rawPath.endsWith('/') ? rawPath.slice(0, -1) : rawPath;
+  const prefixes = ['/'];
+  const segments = normalized.split('/').filter(Boolean);
+  let currentPath = '';
+  segments.forEach((segment) => {
+    currentPath += `/${segment}`;
+    prefixes.push(currentPath);
+  });
+  return prefixes;
+}
+
+/**
+ * cookie Path 是否覆盖当前页面路径
+ * @param {string | undefined} cookiePath
+ * @param {string} pagePathname
+ * @returns {boolean}
+ */
+function isCookieMatchPath(cookiePath, pagePathname) {
+  const path = cookiePath || '/';
+  const pagePath = pagePathname || '/';
+  if (path === '/') {
+    return true;
+  }
+  if (pagePath === path) {
+    return true;
+  }
+  const prefix = path.endsWith('/') ? path : `${path}/`;
+  return pagePath.startsWith(prefix);
+}
+
+/**
+ * 获取标签页对应的 cookie storeId
+ * @param {number} tabId
+ * @returns {Promise<string | undefined>}
+ */
+async function getTabCookieStoreId(tabId) {
+  const stores = await chrome.cookies.getAllCookieStores();
+  const matchedStore = stores.find((store) => store.tabIds.includes(tabId));
+  return matchedStore?.id;
+}
+
+/**
+ * 生成可能相关的 domain 查询值
+ * @param {string} hostname
+ * @returns {string[]}
+ */
+function getCookieDomainCandidates(hostname) {
+  const candidates = new Set([hostname]);
+  const parts = hostname.split('.').filter(Boolean);
+  if (parts.length >= 2) {
+    const root = parts.slice(-2).join('.');
+    candidates.add(root);
+    candidates.add(`.${root}`);
+  }
+  if (parts.length >= 3) {
+    const parent = parts.slice(-3).join('.');
+    candidates.add(parent);
+    candidates.add(`.${parent}`);
+  }
+  return Array.from(candidates);
+}
+
+/**
+ * 确保具备读取目标站点 cookie 的主机权限
+ * @param {string} tabUrl
+ */
+async function ensureCookieHostPermission(tabUrl) {
+  const parsedUrl = new URL(tabUrl);
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    throw new Error('仅支持 http/https 页面读取 cookie');
+  }
+
+  const originPattern = `${parsedUrl.origin}/*`;
+  const hasOrigin = await chrome.permissions.contains({ origins: [originPattern] });
+  const hasWildcard = await chrome.permissions.contains({
+    origins: ['http://*/*', 'https://*/*'],
+  });
+
+  if (hasOrigin || hasWildcard) {
+    return;
+  }
+
+  const granted = await chrome.permissions.request({
+    origins: ['http://*/*', 'https://*/*'],
+  });
+  if (!granted) {
+    throw new Error(
+      '未授予网站访问权限，无法读取 HttpOnly cookie。请打开 chrome://extensions → 本扩展详情 →「网站访问权限」设为「所有网站」，或点击弹窗允许权限后重试'
+    );
+  }
+}
+
+/**
+ * 收集当前主机相关 cookie（含 HttpOnly、任意 Path/子路由）
+ * @param {chrome.tabs.Tab} tab
+ * @returns {Promise<chrome.cookies.Cookie[]>}
+ */
+async function collectTabCookies(tab) {
+  if (!tab.url || !tab.id) {
+    return [];
+  }
+
+  await ensureCookieHostPermission(tab.url);
+  const storeId = await getTabCookieStoreId(tab.id);
+  const parsedUrl = new URL(tab.url);
+  const hostname = parsedUrl.hostname;
+  const origin = parsedUrl.origin;
+  const pathPrefixes = getPathPrefixes(parsedUrl.pathname || '/');
+  const domainCandidates = getCookieDomainCandidates(hostname);
+
+  /** @type {Map<string, chrome.cookies.Cookie>} */
+  const merged = new Map();
+
+  /**
+   * @param {chrome.cookies.Cookie[]} list
+   */
+  const mergeCookies = (list) => {
+    list.forEach((cookie) => {
+      if (!isCookieMatchHostname(cookie, hostname)) {
+        return;
+      }
+      const mapKey = `${cookie.name}\n${cookie.domain}\n${cookie.path}\n${cookie.storeId || ''}`;
+      if (!merged.has(mapKey)) {
+        merged.set(mapKey, cookie);
+      }
+    });
+  };
+
+  // 1. 拉取 store 内全部 cookie，再按主机过滤
+  // 说明：仅用当前 url 查询时，Path 更具体的子路由 cookie（且 host-only）会被漏掉；
+  // domain 查询又拿不到 host-only cookie，所以这里以全量 + 主机过滤为主。
+  const allInStore = await chrome.cookies.getAll(storeId ? { storeId } : {});
+  mergeCookies(allInStore);
+
+  // 2. 按路径前缀逐级查询，覆盖子路由 Path
+  for (const prefix of pathPrefixes) {
+    const prefixUrl = `${origin}${prefix}`;
+    const byPrefix = await chrome.cookies.getAll({
+      url: prefixUrl,
+      ...(storeId ? { storeId } : {}),
+    });
+    mergeCookies(byPrefix);
+  }
+
+  // 3. domain 再补一轮（带 Domain 属性的跨子域 cookie）
+  for (const domain of domainCandidates) {
+    const byDomain = await chrome.cookies.getAll({
+      domain,
+      ...(storeId ? { storeId } : {}),
+    });
+    mergeCookies(byDomain);
+  }
+
+  // 4. storeId 异常时兜底
+  if (!merged.size) {
+    mergeCookies(await chrome.cookies.getAll({}));
+    for (const prefix of pathPrefixes) {
+      mergeCookies(await chrome.cookies.getAll({ url: `${origin}${prefix}` }));
+    }
+  }
+
+  return Array.from(merged.values());
+}
+
+/**
+ * 判断 cookie 是否适用于当前主机
+ * @param {chrome.cookies.Cookie} cookie
+ * @param {string} hostname
+ * @returns {boolean}
+ */
+function isCookieMatchHostname(cookie, hostname) {
+  const rawDomain = cookie.domain || '';
+  const normalizedDomain = rawDomain.startsWith('.') ? rawDomain.slice(1) : rawDomain;
+  if (!normalizedDomain) {
+    return true;
+  }
+  return hostname === normalizedDomain || hostname.endsWith(`.${normalizedDomain}`);
+}
+
+/**
+ * 在同名 cookie 中选出更适合当前路由的一条
+ * @param {chrome.cookies.Cookie[]} cookies
+ * @param {string} pagePathname
+ * @returns {chrome.cookies.Cookie | null}
+ */
+function pickPreferredCookie(cookies, pagePathname) {
+  if (!cookies.length) {
+    return null;
+  }
+
+  const ranked = [...cookies].sort((left, right) => {
+    const leftMatch = isCookieMatchPath(left.path, pagePathname) ? 1 : 0;
+    const rightMatch = isCookieMatchPath(right.path, pagePathname) ? 1 : 0;
+    if (rightMatch !== leftMatch) {
+      return rightMatch - leftMatch;
+    }
+    const pathScore = (right.path || '/').length - (left.path || '/').length;
+    if (pathScore !== 0) {
+      return pathScore;
+    }
+    return Number(right.hostOnly) - Number(left.hostOnly);
+  });
+
+  return ranked[0];
+}
+
+/**
+ * 通过 chrome.cookies 读取单个 cookie（含 HttpOnly）
+ * @param {chrome.tabs.Tab} tab
+ * @param {string} key
+ */
+async function readCookieViaApi(tab, key) {
+  const routeInfo = buildRouteInfoFromTab(tab);
+  const hostname = (() => {
+    try {
+      return new URL(tab.url || '').hostname;
+    } catch {
+      return '';
+    }
+  })();
+  const pathname = (() => {
+    try {
+      return new URL(tab.url || '').pathname || '/';
+    } catch {
+      return '/';
+    }
+  })();
+
+  const allCookies = await collectTabCookies(tab);
+  const matchedCookies = allCookies.filter(
+    (cookie) => cookie.name === key && isCookieMatchHostname(cookie, hostname)
+  );
+  const cookie = pickPreferredCookie(matchedCookies, pathname);
+
+  if (!cookie) {
+    return { ...routeInfo, value: null, cookie: null, httpOnly: false };
+  }
+
+  cookieDetailCache[key] = cookie;
+  applyCookieDetailsToForm(cookie);
+  return {
+    ...routeInfo,
+    value: cookie.value,
+    cookie,
+    httpOnly: Boolean(cookie.httpOnly),
+  };
+}
+
+/**
+ * 通过 chrome.cookies 列出当前页可见 cookie（含 HttpOnly）
+ * @param {chrome.tabs.Tab} tab
+ */
+async function listCookiesViaApi(tab) {
+  const routeInfo = buildRouteInfoFromTab(tab);
+  const hostname = (() => {
+    try {
+      return new URL(tab.url || '').hostname;
+    } catch {
+      return '';
+    }
+  })();
+  const pathname = (() => {
+    try {
+      return new URL(tab.url || '').pathname || '/';
+    } catch {
+      return '/';
+    }
+  })();
+
+  const cookies = (await collectTabCookies(tab)).filter((cookie) =>
+    isCookieMatchHostname(cookie, hostname)
+  );
+
+  /** @type {Record<string, string>} */
+  const entries = {};
+  /** @type {Record<string, chrome.cookies.Cookie>} */
+  const details = {};
+  /** @type {Map<string, chrome.cookies.Cookie[]>} */
+  const groupedByName = new Map();
+
+  cookies.forEach((cookie) => {
+    const list = groupedByName.get(cookie.name) || [];
+    list.push(cookie);
+    groupedByName.set(cookie.name, list);
+  });
+
+  groupedByName.forEach((list, name) => {
+    const preferred = pickPreferredCookie(list, pathname);
+    if (!preferred) {
+      return;
+    }
+    entries[name] = preferred.value;
+    details[name] = preferred;
+  });
+
+  cookieDetailCache = details;
+  const keys = Object.keys(entries).sort((left, right) => left.localeCompare(right));
+  const httpOnlyCount = keys.filter((name) => details[name]?.httpOnly).length;
+  return {
+    ...routeInfo,
+    keys,
+    entries,
+    cookieDetails: details,
+    httpOnlyCount,
+    totalCount: keys.length,
+  };
+}
+
+/**
+ * 通过 chrome.cookies 写入 cookie（可设 HttpOnly）
+ * @param {chrome.tabs.Tab} tab
+ * @param {string} key
+ * @param {string} value
+ * @param {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string, httpOnly: boolean }} options
+ */
+async function writeCookieViaApi(tab, key, value, options) {
+  const routeInfo = buildRouteInfoFromTab(tab);
+  await ensureCookieHostPermission(tab.url || '');
+  const storeId = tab.id ? await getTabCookieStoreId(tab.id) : undefined;
+
+  let sameSite = mapSameSiteToApi(options.sameSite);
+  let secure = Boolean(options.secure);
+  const httpOnly = Boolean(options.httpOnly);
+
+  if (sameSite === 'no_restriction') {
+    secure = true;
+    cookieSecureCheckbox.checked = true;
+  }
+
+  /** @type {chrome.cookies.SetDetails} */
+  const details = {
+    url: normalizeCookieQueryUrl(tab.url || ''),
+    name: key,
+    value,
+    path: options.path || '/',
+    secure,
+    httpOnly,
+  };
+
+  if (options.domain) {
+    details.domain = options.domain;
+  }
+  if (sameSite) {
+    details.sameSite = sameSite;
+  }
+  if (options.maxAge !== null && options.maxAge !== undefined && Number.isFinite(options.maxAge)) {
+    details.expirationDate = Date.now() / 1000 + options.maxAge;
+  }
+  if (storeId) {
+    details.storeId = storeId;
+  }
+
+  const result = await chrome.cookies.set(details);
+  if (!result) {
+    return { ...routeInfo, value: null, success: false, httpOnly };
+  }
+
+  cookieDetailCache[key] = result;
+  applyCookieDetailsToForm(result);
+  return {
+    ...routeInfo,
+    value: result.value,
+    success: result.value === value,
+    httpOnly: Boolean(result.httpOnly),
+    cookie: result,
+  };
+}
+
+/**
+ * 通过 chrome.cookies 删除 cookie（含 HttpOnly）
+ * @param {chrome.tabs.Tab} tab
+ * @param {string} key
+ * @param {{ path?: string, domain?: string }} [options]
+ */
+async function deleteCookieViaApi(tab, key, options = {}) {
+  const routeInfo = buildRouteInfoFromTab(tab);
+  await ensureCookieHostPermission(tab.url || '');
+
+  const matchedCookies = (await collectTabCookies(tab)).filter((cookie) => cookie.name === key);
+  const cached = cookieDetailCache[key];
+  const targets = matchedCookies.length ? matchedCookies : cached ? [cached] : [];
+
+  if (!targets.length) {
+    const storeId = tab.id ? await getTabCookieStoreId(tab.id) : undefined;
+    await chrome.cookies.remove({
+      url: normalizeCookieQueryUrl(tab.url || ''),
+      name: key,
+      ...(storeId ? { storeId } : {}),
+    });
+  } else {
+    for (const cookie of targets) {
+      await chrome.cookies.remove({
+        url: buildCookieUrl(cookie, tab),
+        name: key,
+        storeId: cookie.storeId,
+      });
+    }
+  }
+
+  const remainAfter = (await collectTabCookies(tab)).filter((cookie) => cookie.name === key);
+  if (remainAfter.length) {
+    for (const cookie of remainAfter) {
+      await chrome.cookies.remove({
+        url: buildCookieUrl(cookie, tab),
+        name: key,
+        storeId: cookie.storeId,
+      });
+    }
+  }
+
+  if (options.path || options.domain) {
+    try {
+      const parsed = new URL(tab.url || '');
+      const domain = (options.domain || parsed.hostname).replace(/^\./, '');
+      const path = options.path || '/';
+      const storeId = tab.id ? await getTabCookieStoreId(tab.id) : undefined;
+      for (const protocol of ['https:', 'http:']) {
+        await chrome.cookies.remove({
+          url: `${protocol}//${domain}${path}`,
+          name: key,
+          ...(storeId ? { storeId } : {}),
+        });
+      }
+    } catch {
+      // 忽略兜底失败
+    }
+  }
+
+  const remainFinal = (await collectTabCookies(tab)).filter((cookie) => cookie.name === key);
+  if (!remainFinal.length) {
+    delete cookieDetailCache[key];
+  }
+  return { ...routeInfo, success: remainFinal.length === 0 };
+}
+
+/**
+ * 批量通过 chrome.cookies 写入
+ * @param {chrome.tabs.Tab} tab
+ * @param {Record<string, string>} entries
+ * @param {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string, httpOnly: boolean }} options
+ */
+async function writeCookiesBatchViaApi(tab, entries, options) {
+  const routeInfo = buildRouteInfoFromTab(tab);
+  let successCount = 0;
+  let failCount = 0;
+  const entryList = Object.entries(entries || {});
+
+  for (const [key, rawValue] of entryList) {
+    const value = rawValue == null ? '' : String(rawValue);
+    try {
+      const result = await writeCookieViaApi(tab, key, value, options);
+      if (result.success) {
+        successCount += 1;
+      } else {
+        failCount += 1;
+      }
+    } catch {
+      failCount += 1;
+    }
+  }
+
+  return { ...routeInfo, successCount, failCount, total: entryList.length };
+}
+
+/**
+ * 统一读取（cookie 走 API，其余走页面注入）
+ * @param {chrome.tabs.Tab} tab
+ * @param {string} storageType
+ * @param {string} key
+ */
+async function readStorageValue(tab, storageType, key) {
+  if (storageType === STORAGE_TYPES.cookie) {
+    return readCookieViaApi(tab, key);
+  }
+  return executeInTab(tab.id, readPageStorage, [storageType, key]);
+}
+
+/**
+ * 统一写入
+ * @param {chrome.tabs.Tab} tab
+ * @param {string} storageType
+ * @param {string} key
+ * @param {string} value
+ * @param {ReturnType<typeof getCookieWriteOptions>} [cookieOptions]
+ */
+async function writeStorageValue(tab, storageType, key, value, cookieOptions) {
+  if (storageType === STORAGE_TYPES.cookie) {
+    return writeCookieViaApi(tab, key, value, cookieOptions || getCookieWriteOptions());
+  }
+  return executeInTab(tab.id, writePageStorage, [storageType, key, value, cookieOptions]);
+}
+
+/**
+ * 统一删除
+ * @param {chrome.tabs.Tab} tab
+ * @param {string} storageType
+ * @param {string} key
+ * @param {{ path?: string, domain?: string }} [cookieOptions]
+ */
+async function deleteStorageValue(tab, storageType, key, cookieOptions) {
+  if (storageType === STORAGE_TYPES.cookie) {
+    return deleteCookieViaApi(tab, key, cookieOptions);
+  }
+  return executeInTab(tab.id, deletePageStorage, [storageType, key, cookieOptions]);
+}
+
+/**
  * 渲染路由信息
  * @param {{ href?: string, hash?: string, pathname?: string, origin?: string }} routeInfo
  */
@@ -639,7 +1266,7 @@ function updateKeyPlaceholder() {
 
 /**
  * 读取 Cookie 写入表单选项
- * @returns {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string }}
+ * @returns {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string, httpOnly: boolean }}
  */
 function getCookieWriteOptions() {
   const path = cookiePathInput.value.trim() || '/';
@@ -649,13 +1276,14 @@ function getCookieWriteOptions() {
   const domain = cookieDomainInput.value.trim();
   let sameSite = cookieSameSiteSelect.value;
   let secure = cookieSecureCheckbox.checked;
+  const httpOnly = cookieHttpOnlyCheckbox.checked;
 
   if (sameSite === 'None') {
     secure = true;
     cookieSecureCheckbox.checked = true;
   }
 
-  return { path, maxAge, domain, secure, sameSite };
+  return { path, maxAge, domain, secure, sameSite, httpOnly };
 }
 
 /**
@@ -736,6 +1364,24 @@ function normalizeHistoryList(list) {
 }
 
 /**
+ * 同步历史面板显隐与按钮态
+ */
+function syncHistoryPanelVisibility() {
+  historyPanelEl.hidden = !isHistoryPanelOpen;
+  toggleHistoryBtn.classList.toggle('is-active', isHistoryPanelOpen);
+  toggleHistoryBtn.setAttribute('aria-expanded', String(isHistoryPanelOpen));
+}
+
+/**
+ * 切换历史面板
+ */
+function toggleHistoryPanel() {
+  isHistoryPanelOpen = !isHistoryPanelOpen;
+  syncHistoryPanelVisibility();
+  renderKeyHistory(historyKeyCache);
+}
+
+/**
  * 渲染最近 key 历史
  * @param {string[]} historyList
  */
@@ -743,14 +1389,20 @@ function renderKeyHistory(historyList) {
   const list = normalizeHistoryList(historyList);
   historyKeyCache = list;
 
+  syncHistoryPanelVisibility();
+
   if (!list.length) {
-    historyPanelEl.hidden = true;
     historyRowEl.innerHTML = '';
     historyRowEl.classList.remove('is-scrollable');
+    historyRowEl.hidden = true;
+    historyEmptyTipEl.hidden = false;
+    clearHistoryBtn.disabled = true;
     return;
   }
 
-  historyPanelEl.hidden = false;
+  historyEmptyTipEl.hidden = true;
+  historyRowEl.hidden = false;
+  clearHistoryBtn.disabled = false;
   historyRowEl.innerHTML = list
     .map((key) => {
       const encodedKey = encodeURIComponent(key);
@@ -763,6 +1415,9 @@ function renderKeyHistory(historyList) {
     .join('');
 
   requestAnimationFrame(() => {
+    if (historyPanelEl.hidden) {
+      return;
+    }
     const canScroll = historyRowEl.scrollHeight > historyRowEl.clientHeight + 1;
     historyRowEl.classList.toggle('is-scrollable', canScroll);
   });
@@ -911,7 +1566,15 @@ async function refreshPageKeys(renderList = false) {
   try {
     const tab = await getActiveTab();
     assertInjectableTab(tab);
-    const pageData = await executeInTab(tab.id, listPageStorageKeys, [currentStorageType]);
+
+    let pageData;
+    if (currentStorageType === STORAGE_TYPES.cookie) {
+      pageData = await listCookiesViaApi(tab);
+    } else {
+      pageData = await executeInTab(tab.id, listPageStorageKeys, [currentStorageType]);
+      cookieDetailCache = {};
+    }
+
     pageKeyCache = Array.isArray(pageData.keys) ? pageData.keys : [];
     pageEntriesCache =
       pageData.entries && typeof pageData.entries === 'object' ? pageData.entries : {};
@@ -923,6 +1586,7 @@ async function refreshPageKeys(renderList = false) {
   } catch (error) {
     pageKeyCache = [];
     pageEntriesCache = {};
+    cookieDetailCache = {};
     if (renderList || !keysPanelEl.hidden) {
       renderKeysList(keysFilterInput.value.trim());
     }
@@ -950,7 +1614,23 @@ function renderKeysList(filterText = '') {
     .map((key) => {
       const encodedKey = encodeURIComponent(key);
       const safeLabel = escapeHtml(key);
-      return `<button class="keys-item" type="button" data-key="${encodedKey}" title="${safeLabel}">${safeLabel}</button>`;
+      const detail = cookieDetailCache[key];
+      const badges = [];
+      if (detail?.path && detail.path !== '/') {
+        badges.push(`<span class="keys-badge is-path" title="Path">${escapeHtml(detail.path)}</span>`);
+      }
+      if (detail?.httpOnly) {
+        badges.push('<span class="keys-badge is-httponly">HttpOnly</span>');
+      }
+      if (detail?.secure) {
+        badges.push('<span class="keys-badge is-secure">Secure</span>');
+      }
+      const badgeHtml = badges.length
+        ? `<span class="keys-item-badges">${badges.join('')}</span>`
+        : '';
+      return `<button class="keys-item" type="button" data-key="${encodedKey}" title="${safeLabel}">
+          <span class="keys-item-name">${safeLabel}</span>${badgeHtml}
+        </button>`;
     })
     .join('');
 }
@@ -969,7 +1649,15 @@ async function toggleKeysPanel() {
   setStatus('正在加载全部 Key...', '');
   try {
     await refreshPageKeys(true);
-    setStatus(`共 ${pageKeyCache.length} 个 key`, pageKeyCache.length ? 'success' : 'empty');
+    if (currentStorageType === STORAGE_TYPES.cookie) {
+      const httpOnlyCount = Object.values(cookieDetailCache).filter((item) => item.httpOnly).length;
+      setStatus(
+        `共 ${pageKeyCache.length} 个 cookie（HttpOnly ${httpOnlyCount}）`,
+        pageKeyCache.length ? 'success' : 'empty'
+      );
+    } else {
+      setStatus(`共 ${pageKeyCache.length} 个 key`, pageKeyCache.length ? 'success' : 'empty');
+    }
   } catch (error) {
     setStatus(error instanceof Error ? error.message : '加载 Key 失败', 'error');
   }
@@ -1094,6 +1782,7 @@ async function switchStorageType(storageType) {
   hideKeySuggest();
   pageKeyCache = [];
   pageEntriesCache = {};
+  cookieDetailCache = {};
 
   const historyList = await loadAndRenderKeyHistory();
   storageKeyInput.value = historyList[0] || '';
@@ -1154,7 +1843,7 @@ async function handleRead() {
     const tab = await getActiveTab();
     assertInjectableTab(tab);
 
-    const pageData = await executeInTab(tab.id, readPageStorage, [currentStorageType, key]);
+    const pageData = await readStorageValue(tab, currentStorageType, key);
     renderRouteInfo(pageData);
     await pushKeyHistory(key);
 
@@ -1162,19 +1851,16 @@ async function handleRead() {
       valueInput.value = '';
       autoResizeValueInput();
       updateValueMeta();
-      const tip =
-        currentStorageType === STORAGE_TYPES.cookie
-          ? `cookie "${key}" 不存在（HttpOnly cookie 无法通过脚本读取）`
-          : `key "${key}" 不存在`;
-      setStatus(tip, 'empty');
+      setStatus(`key "${key}" 不存在`, 'empty');
     } else {
       valueInput.value = pageData.value;
       autoResizeValueInput();
       updateValueMeta();
       await saveLastValue(pageData.value);
       const byteLength = new TextEncoder().encode(pageData.value).length;
+      const httpOnlyTip = pageData.httpOnly ? ' · HttpOnly' : '';
       setStatus(
-        `读取成功（${getStorageTypeLabel(currentStorageType)}），${pageData.value.length} 字符 · ${byteLength} 字节`,
+        `读取成功（${getStorageTypeLabel(currentStorageType)}${httpOnlyTip}），${pageData.value.length} 字符 · ${byteLength} 字节`,
         'success'
       );
     }
@@ -1215,7 +1901,7 @@ async function handleWrite() {
     const tab = await getActiveTab();
     assertInjectableTab(tab);
 
-    const existingData = await executeInTab(tab.id, readPageStorage, [currentStorageType, key]);
+    const existingData = await readStorageValue(tab, currentStorageType, key);
     if (existingData.value !== null && existingData.value !== value) {
       const confirmed = await showConfirmDialog({
         title: `确认覆盖写入「${key}」？`,
@@ -1244,12 +1930,13 @@ async function handleWrite() {
 
     const cookieOptions =
       currentStorageType === STORAGE_TYPES.cookie ? getCookieWriteOptions() : undefined;
-    const pageData = await executeInTab(tab.id, writePageStorage, [
+    const pageData = await writeStorageValue(
+      tab,
       currentStorageType,
       key,
       value,
-      cookieOptions,
-    ]);
+      cookieOptions
+    );
     renderRouteInfo(pageData);
     valueInput.value = pageData.value ?? value;
     autoResizeValueInput();
@@ -1260,7 +1947,7 @@ async function handleWrite() {
     if (!pageData.success) {
       const failTip =
         currentStorageType === STORAGE_TYPES.cookie
-          ? '写入后回读不一致（可能被浏览器拒绝：Secure/SameSite/Domain/大小限制，或与 HttpOnly 冲突）'
+          ? '写入后回读不一致（可能被浏览器拒绝：Secure/SameSite/Domain/大小限制等）'
           : '写入后回读不一致，请确认页面是否允许写入';
       setStatus(failTip, 'error');
       return;
@@ -1282,6 +1969,9 @@ async function handleWrite() {
       }
       if (cookieOptions.secure) {
         parts.push('Secure');
+      }
+      if (cookieOptions.httpOnly) {
+        parts.push('HttpOnly');
       }
       cookieTip = `（${parts.join('，')}）`;
     }
@@ -1321,12 +2011,16 @@ async function handleDelete() {
   try {
     const tab = await getActiveTab();
     assertInjectableTab(tab);
-    const existingData = await executeInTab(tab.id, readPageStorage, [currentStorageType, key]);
+    const existingData = await readStorageValue(tab, currentStorageType, key);
 
     let body =
       existingData.value === null
-        ? `当前读不到「${key}」的值（可能不存在或为 HttpOnly）。仍尝试删除？`
+        ? `当前读不到「${key}」的值（可能不存在）。仍尝试删除？`
         : `将删除「${key}」当前值（${existingData.value.length} 字符）：\n${truncateText(existingData.value)}`;
+
+    if (existingData.httpOnly) {
+      body += '\n\n该 cookie 为 HttpOnly，将通过 chrome.cookies API 删除。';
+    }
 
     if (currentStorageType === STORAGE_TYPES.cookie) {
       body += '\n\n提示：若删除失败，可尝试调整上方 Path / Domain 后再删。';
@@ -1351,17 +2045,13 @@ async function handleDelete() {
     const cookieOptions = writeOptions
       ? { path: writeOptions.path, domain: writeOptions.domain }
       : undefined;
-    const pageData = await executeInTab(tab.id, deletePageStorage, [
-      currentStorageType,
-      key,
-      cookieOptions,
-    ]);
+    const pageData = await deleteStorageValue(tab, currentStorageType, key, cookieOptions);
     renderRouteInfo(pageData);
 
     if (!pageData.success) {
       const failTip =
         currentStorageType === STORAGE_TYPES.cookie
-          ? '删除失败：cookie 仍存在。可尝试修改 Path/Domain 后再删；HttpOnly cookie 无法通过脚本删除'
+          ? '删除失败：cookie 仍存在。可尝试修改 Path/Domain 后再删'
           : '删除失败：key 仍存在';
       setStatus(failTip, 'error');
       return;
@@ -1489,11 +2179,17 @@ async function handleImportFile(file) {
     assertInjectableTab(tab);
     const cookieOptions =
       currentStorageType === STORAGE_TYPES.cookie ? getCookieWriteOptions() : undefined;
-    const result = await executeInTab(tab.id, writePageStorageBatch, [
-      currentStorageType,
-      entries,
-      cookieOptions,
-    ]);
+
+    let result;
+    if (currentStorageType === STORAGE_TYPES.cookie) {
+      result = await writeCookiesBatchViaApi(tab, entries, cookieOptions);
+    } else {
+      result = await executeInTab(tab.id, writePageStorageBatch, [
+        currentStorageType,
+        entries,
+        cookieOptions,
+      ]);
+    }
     renderRouteInfo(result);
     await refreshPageKeys(true);
 
@@ -1721,12 +2417,21 @@ async function initPopup() {
   storageTypeTabsEl.addEventListener('keydown', handleTablistKeydown);
 
   clearHistoryBtn.addEventListener('click', clearAllKeyHistory);
+  toggleHistoryBtn.addEventListener('click', toggleHistoryPanel);
   browseKeysBtn.addEventListener('click', toggleKeysPanel);
   refreshKeysBtn.addEventListener('click', async () => {
     setStatus('刷新中...', '');
     try {
       await refreshPageKeys(true);
-      setStatus(`共 ${pageKeyCache.length} 个 key`, pageKeyCache.length ? 'success' : 'empty');
+      if (currentStorageType === STORAGE_TYPES.cookie) {
+        const httpOnlyCount = Object.values(cookieDetailCache).filter((item) => item.httpOnly).length;
+        setStatus(
+          `共 ${pageKeyCache.length} 个 cookie（HttpOnly ${httpOnlyCount}）`,
+          pageKeyCache.length ? 'success' : 'empty'
+        );
+      } else {
+        setStatus(`共 ${pageKeyCache.length} 个 key`, pageKeyCache.length ? 'success' : 'empty');
+      }
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '刷新失败', 'error');
     }

@@ -80,6 +80,9 @@
             <ul id="keySuggestList" class="key-suggest" role="listbox" hidden></ul>
           </div>
           <button id="readBtn" class="btn btn-primary" type="button">读取</button>
+          <button id="toggleHistoryBtn" class="btn btn-secondary" type="button" aria-expanded="false">
+            历史
+          </button>
           <button id="browseKeysBtn" class="btn btn-secondary" type="button">全部 Key</button>
         </div>
 
@@ -89,6 +92,7 @@
             <button id="clearHistoryBtn" class="history-clear-all" type="button">清空</button>
           </div>
           <div class="history-row" id="historyRow"></div>
+          <p id="historyEmptyTip" class="history-empty" hidden>暂无历史记录</p>
         </div>
 
         <div class="keys-panel" id="keysPanel" hidden>
@@ -112,11 +116,17 @@
 
         <div class="cookie-bar" id="cookieOptions" hidden>
           <div class="cookie-bar-head">
-            <span class="cookie-bar-title">Cookie 属性</span>
-            <label class="cookie-secure">
-              <input id="cookieSecure" type="checkbox" />
-              <span>Secure</span>
-            </label>
+            <span class="cookie-bar-title">Cookie 属性（支持 HttpOnly）</span>
+            <div class="cookie-flags">
+              <label class="cookie-secure">
+                <input id="cookieSecure" type="checkbox" />
+                <span>Secure</span>
+              </label>
+              <label class="cookie-secure">
+                <input id="cookieHttpOnly" type="checkbox" />
+                <span>HttpOnly</span>
+              </label>
+            </div>
           </div>
           <div class="cookie-bar-fields">
             <label class="cookie-cell">

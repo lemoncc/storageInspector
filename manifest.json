@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
   "name": "应用存储读/写",
-  "version": "1.6.0",
-  "description": "读取/写入当前页面 localStorage、sessionStorage、cookie 指定 key 的值",
-  "permissions": ["activeTab", "scripting", "storage"],
+  "version": "1.7.2",
+  "description": "读取/写入当前页面 localStorage、sessionStorage、cookie（含 HttpOnly）指定 key 的值",
+  "permissions": ["activeTab", "scripting", "storage", "cookies"],
+  "host_permissions": ["http://*/*", "https://*/*"],
   "action": {
     "default_popup": "popup/index.html",
     "default_title": "应用存储读/写",
