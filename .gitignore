@@ -1,0 +1,38 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs & debug
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Dependencies (if added later)
+node_modules/
+
+# Build / package artifacts
+dist/
+build/
+*.crx
+*.pem
+*.zip
+web-ext-artifacts/
+
+# Local / temp
+*.local
+.tmp/
+.temp/
+test.json
+.env
+.env.*
