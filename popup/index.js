@@ -2862,7 +2862,18 @@ async function handleCopy() {
   }
 
   try {
-    await navigator.clipboard.writeText(text);
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      // 降级：选中文本框后 execCommand
+      valueInput.focus();
+      valueInput.select();
+      const copied = document.execCommand('copy');
+      valueInput.setSelectionRange(valueInput.value.length, valueInput.value.length);
+      if (!copied) {
+        throw new Error('execCommand copy failed');
+      }
+    }
     await saveLastValue(text);
     setActionStatus('已复制到剪贴板', 'success');
   } catch {
@@ -2872,12 +2883,16 @@ async function handleCopy() {
 
 /**
  * 从剪贴板粘贴到文本框
+ * 依赖 manifest 的 clipboardRead；扩展页点击按钮读剪贴板必须声明该权限
  */
 async function handlePaste() {
   try {
+    if (!navigator.clipboard?.readText) {
+      throw new Error('clipboard API unavailable');
+    }
     const text = await navigator.clipboard.readText();
     if (!text) {
-      setActionStatus('剪贴板为空', 'empty');
+      setActionStatus('剪贴板为空（或非文本内容）', 'empty');
       return;
     }
     valueInput.value = text;
@@ -2887,7 +2902,10 @@ async function handlePaste() {
     setActionStatus(`已粘贴，长度 ${text.length}，可点击右上角「写入」`, 'success');
     valueInput.focus();
   } catch {
-    setActionStatus('粘贴失败，请手动 Ctrl/Cmd + V 粘贴到输入框', 'error');
+    setActionStatus(
+      '粘贴失败：请重新加载扩展后再试，或直接在输入框按 Ctrl/Cmd + V',
+      'error'
+    );
     valueInput.focus();
   }
 }

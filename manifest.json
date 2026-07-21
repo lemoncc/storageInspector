@@ -3,7 +3,7 @@
   "name": "应用存储管理",
   "version": "1.7.7",
   "description": "管理当前页面的 localStorage、sessionStorage 与 Cookie（含 HttpOnly）：支持按 Key 查询、新增/修改、删除，并可浏览全部 Key、导入导出数据",
-  "permissions": ["activeTab", "scripting", "storage", "cookies"],
+  "permissions": ["activeTab", "scripting", "storage", "cookies", "clipboardRead", "clipboardWrite"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "action": {
     "default_popup": "popup/index.html",
