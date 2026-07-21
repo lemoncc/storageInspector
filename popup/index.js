@@ -10,7 +10,8 @@ const LAST_TYPE_STORAGE = 'last-storage-type';
 const LEGACY_LAST_VALUE_STORAGE = 'last-storage-value';
 const AUTO_READ_SETTING = 'setting-auto-read';
 const HISTORY_LIMIT = 10;
-const SUGGEST_LIMIT = 8;
+/** 备选项优先展示的历史条数（按最近使用倒序） */
+const HISTORY_SUGGEST_LIMIT = 3;
 const DIFF_PREVIEW_LIMIT = 240;
 /** Chrome 插件 popup 高度实际上限 */
 const CHROME_POPUP_HEIGHT_LIMIT = 600;
@@ -96,6 +97,8 @@ let cookieDetailCache = {};
 let suggestItems = [];
 let suggestActiveIndex = -1;
 let suggestBlurTimer = null;
+/** 备选请求序号，避免异步回写互相覆盖 */
+let suggestRequestId = 0;
 
 /**
  * 获取某存储类型最近一次 key 的缓存字段
@@ -1636,15 +1639,26 @@ function renderKeysList(filterText = '') {
 }
 
 /**
+ * 同步全部 Key 面板按钮态
+ */
+function syncKeysPanelButton() {
+  const isOpen = !keysPanelEl.hidden;
+  browseKeysBtn.classList.toggle('is-active', isOpen);
+  browseKeysBtn.setAttribute('aria-expanded', String(isOpen));
+}
+
+/**
  * 切换全部 Key 面板
  */
 async function toggleKeysPanel() {
   if (!keysPanelEl.hidden) {
     keysPanelEl.hidden = true;
+    syncKeysPanelButton();
     return;
   }
 
   keysPanelEl.hidden = false;
+  syncKeysPanelButton();
   keysFilterInput.value = '';
   setStatus('正在加载全部 Key...', '');
   try {
@@ -1664,34 +1678,62 @@ async function toggleKeysPanel() {
 }
 
 /**
- * 合并联想候选
+ * 取历史备选（最近使用倒序，最多 N 条）
+ * @param {string} keyword
+ * @returns {string[]}
+ */
+function getHistorySuggestKeys(keyword) {
+  const normalizedKeyword = keyword.trim().toLowerCase();
+  // historyKeyCache 本身是最近在前
+  const orderedHistory = historyKeyCache.filter((key) => {
+    if (!normalizedKeyword) {
+      return true;
+    }
+    return key.toLowerCase().includes(normalizedKeyword);
+  });
+  return orderedHistory.slice(0, HISTORY_SUGGEST_LIMIT);
+}
+
+/**
+ * 仅用历史记录构建备选项（先展示，再异步补全页面 Key）
+ * @param {string} query
+ * @returns {Array<{ key: string, source: string }>}
+ */
+function buildHistorySuggestItems(query) {
+  return getHistorySuggestKeys(query).map((key) => ({
+    key,
+    source: '历史记录',
+  }));
+}
+
+/**
+ * 合并联想候选：先历史倒序 3 条，再追加全部页面 Key（去重）
  * @param {string} query
  * @returns {Array<{ key: string, source: string }>}
  */
 function buildSuggestItems(query) {
   const keyword = query.trim().toLowerCase();
-  /** @type {Map<string, string>} */
-  const merged = new Map();
+  /** @type {Array<{ key: string, source: string }>} */
+  const items = [];
+  const seenKeys = new Set();
 
-  historyKeyCache.forEach((key) => {
-    if (!keyword || key.toLowerCase().includes(keyword)) {
-      merged.set(key, '历史');
-    }
+  getHistorySuggestKeys(query).forEach((key) => {
+    items.push({ key, source: '历史记录' });
+    seenKeys.add(key);
   });
 
   pageKeyCache.forEach((key) => {
-    if (!keyword || key.toLowerCase().includes(keyword)) {
-      if (!merged.has(key)) {
-        merged.set(key, '页面');
-      } else if (merged.get(key) === '历史') {
-        merged.set(key, '历史/页面');
-      }
+    if (seenKeys.has(key)) {
+      return;
     }
+    if (keyword && !key.toLowerCase().includes(keyword)) {
+      return;
+    }
+    items.push({ key, source: '页面' });
+    seenKeys.add(key);
   });
 
-  return Array.from(merged.entries())
-    .map(([key, source]) => ({ key, source }))
-    .slice(0, SUGGEST_LIMIT);
+  return items;
 }
 
 /**
@@ -1705,10 +1747,27 @@ function hideKeySuggest() {
 }
 
 /**
- * 渲染联想列表
+ * 当前输入框是否仍持有焦点
+ * @returns {boolean}
  */
-function renderKeySuggest() {
+function isStorageKeyInputFocused() {
+  return document.activeElement === storageKeyInput;
+}
+
+/**
+ * 渲染联想列表
+ * @param {{ loading?: boolean }} [options]
+ */
+function renderKeySuggest(options = {}) {
+  const { loading = false } = options;
+
   if (!suggestItems.length) {
+    if (loading && isStorageKeyInputFocused()) {
+      keySuggestListEl.hidden = false;
+      keySuggestListEl.innerHTML =
+        '<li class="key-suggest-item is-muted" role="option">加载备选中...</li>';
+      return;
+    }
     hideKeySuggest();
     return;
   }
@@ -1726,26 +1785,42 @@ function renderKeySuggest() {
 }
 
 /**
- * 刷新并展示联想
+ * 刷新并展示联想：先历史 3 条，再加载全部页面 Key
+ * @param {boolean} [forceShow]
  */
 async function updateKeySuggest(forceShow = false) {
+  const requestId = ++suggestRequestId;
   const query = storageKeyInput.value;
-  if (!forceShow && !query.trim() && document.activeElement !== storageKeyInput) {
-    hideKeySuggest();
+
+  // 未聚焦且非强制时不展示（避免无关调用把列表关掉又打开）
+  if (!forceShow && !isStorageKeyInputFocused()) {
     return;
   }
 
-  if (!pageKeyCache.length) {
-    try {
-      await refreshPageKeys(false);
-    } catch {
-      // 联想失败时仍可用历史
-    }
+  // 先立刻展示历史倒序 3 条；若暂无历史，显示加载态，避免被误判为「没备选」
+  suggestItems = buildHistorySuggestItems(query);
+  suggestActiveIndex = suggestItems.length ? 0 : -1;
+  renderKeySuggest({ loading: !suggestItems.length });
+
+  // 再异步加载页面全部 Key 并追加
+  try {
+    await refreshPageKeys(false);
+  } catch {
+    // 页面 Key 加载失败时保留历史备选
   }
 
-  suggestItems = buildSuggestItems(query);
+  // 过期请求或已失焦：不再回写，防止把正在展示的列表清掉
+  if (requestId !== suggestRequestId) {
+    return;
+  }
+  if (!isStorageKeyInputFocused()) {
+    return;
+  }
+
+  const latestQuery = storageKeyInput.value;
+  suggestItems = buildSuggestItems(latestQuery);
   suggestActiveIndex = suggestItems.length ? 0 : -1;
-  renderKeySuggest();
+  renderKeySuggest({ loading: false });
 }
 
 /**
@@ -2527,12 +2602,23 @@ async function initPopup() {
     updateKeySuggest(true);
   });
   storageKeyInput.addEventListener('focus', () => {
+    if (suggestBlurTimer) {
+      clearTimeout(suggestBlurTimer);
+      suggestBlurTimer = null;
+    }
     updateKeySuggest(true);
   });
   storageKeyInput.addEventListener('blur', () => {
+    if (suggestBlurTimer) {
+      clearTimeout(suggestBlurTimer);
+    }
     suggestBlurTimer = setTimeout(() => {
+      // 失焦后若焦点又回到输入框（如点清空按钮），不隐藏
+      if (isStorageKeyInputFocused()) {
+        return;
+      }
       hideKeySuggest();
-    }, 150);
+    }, 180);
   });
   keySuggestListEl.addEventListener('mousedown', (event) => {
     event.preventDefault();
@@ -2546,6 +2632,9 @@ async function initPopup() {
     }
     const item = target.closest('.key-suggest-item');
     if (!(item instanceof HTMLElement)) {
+      return;
+    }
+    if (item.classList.contains('is-muted')) {
       return;
     }
     const index = Number(item.dataset.index);
@@ -2604,6 +2693,8 @@ async function initPopup() {
   });
 
   refreshPageKeys(false).catch(() => {});
+  syncKeysPanelButton();
+  syncHistoryPanelVisibility();
 
   if (storageKeyInput.value.trim() && isAutoReadEnabled()) {
     await handleRead();

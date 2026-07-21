@@ -81,9 +81,11 @@
           </div>
           <button id="readBtn" class="btn btn-primary" type="button">读取</button>
           <button id="toggleHistoryBtn" class="btn btn-secondary" type="button" aria-expanded="false">
-            历史
+            历史记录
           </button>
-          <button id="browseKeysBtn" class="btn btn-secondary" type="button">全部 Key</button>
+          <button id="browseKeysBtn" class="btn btn-secondary" type="button" aria-expanded="false">
+            全部 Key
+          </button>
         </div>
 
         <div class="history-panel" id="historyPanel" hidden>
@@ -97,21 +99,24 @@
 
         <div class="keys-panel" id="keysPanel" hidden>
           <div class="keys-toolbar">
-            <input
-              id="keysFilterInput"
-              class="keys-filter"
-              type="text"
-              placeholder="筛选 key"
-              spellcheck="false"
-              autocomplete="off"
-            />
-            <button id="refreshKeysBtn" class="btn btn-ghost" type="button">刷新</button>
-            <button id="exportBtn" class="btn btn-ghost" type="button">导出</button>
-            <button id="importBtn" class="btn btn-ghost" type="button">导入</button>
-            <input id="importFileInput" type="file" accept="application/json,.json" hidden />
+            <span class="keys-toolbar-label">全部 Key</span>
+            <div class="keys-toolbar-actions">
+              <button id="refreshKeysBtn" class="btn btn-ghost" type="button">刷新</button>
+              <button id="exportBtn" class="btn btn-ghost" type="button">导出</button>
+              <button id="importBtn" class="btn btn-ghost" type="button">导入</button>
+            </div>
           </div>
+          <input
+            id="keysFilterInput"
+            class="keys-filter"
+            type="text"
+            placeholder="筛选 key"
+            spellcheck="false"
+            autocomplete="off"
+          />
           <div id="keysList" class="keys-list"></div>
           <p id="keysEmptyTip" class="keys-empty" hidden>暂无 key</p>
+          <input id="importFileInput" type="file" accept="application/json,.json" hidden />
         </div>
 
         <div class="cookie-bar" id="cookieOptions" hidden>
