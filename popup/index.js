@@ -2664,17 +2664,14 @@ async function handleJsonDialogSave() {
   }
   const saved = await handleRowSave(appliedRowId);
   if (!saved) {
-    const tip = statusTextEl.textContent || '';
-    if (tip === '已取消保存') {
-      if (targetRow) {
-        targetRow.value = previousValue;
-      }
-      const textarea = getRowValueTextarea(appliedRowId);
-      if (textarea) {
-        textarea.value = previousDomValue;
-      }
-      syncRowModelFromDom(appliedRowId);
+    if (targetRow) {
+      targetRow.value = previousValue;
     }
+    const textarea = getRowValueTextarea(appliedRowId);
+    if (textarea) {
+      textarea.value = previousDomValue;
+    }
+    syncRowModelFromDom(appliedRowId);
     return;
   }
   closeJsonDialog();
@@ -4348,7 +4345,8 @@ async function handleRowCopy(rowId) {
       const copied = document.execCommand('copy');
       textarea.setSelectionRange(textarea.value.length, textarea.value.length);
       if (!copied) {
-        throw new Error('execCommand copy failed');
+        setStatus('复制失败，请手动选中复制', 'error');
+        return;
       }
     }
     setStatus('已复制到剪贴板', 'success');
@@ -4368,10 +4366,16 @@ async function handleRowPaste(rowId) {
   }
   ensureFormatBoundToRow(rowId);
 
+  if (!navigator.clipboard?.readText) {
+    setStatus(
+      '粘贴失败：请重新加载扩展后再试，或直接在输入框按 Ctrl/Cmd + V',
+      'error'
+    );
+    textarea.focus();
+    return;
+  }
+
   try {
-    if (!navigator.clipboard?.readText) {
-      throw new Error('clipboard API unavailable');
-    }
     const text = await navigator.clipboard.readText();
     if (!text) {
       setStatus('剪贴板为空（或非文本内容）', 'empty');
@@ -4483,9 +4487,11 @@ async function handleRowSave(rowId) {
   const keptEditsOnWrite = formatExpandDirty && prepared.restoredCount > 0;
 
   // 保存前先把压缩结果回写到单元格，与「编辑自动格式化」对称
-  if (value !== textarea.value) {
+  if (textarea && value !== textarea.value) {
     textarea.value = value;
     syncRowModelFromDom(rowId);
+  } else if (!textarea) {
+    row.value = value;
   }
 
   const isStorageRename =
@@ -4795,8 +4801,12 @@ async function handleRowSave(rowId) {
     }
 
     clearFormatStateForUi();
-    textarea.value = pageData.value ?? value;
-    syncRowModelFromDom(rowId);
+    if (textarea) {
+      textarea.value = pageData.value ?? value;
+      syncRowModelFromDom(rowId);
+    } else {
+      row.value = pageData.value ?? value;
+    }
     await pushKeyHistory(key);
 
     let cookieTip = '';
@@ -4951,7 +4961,7 @@ async function handleRowDelete(rowId) {
     if (!pageData.success) {
       const failTip =
         currentStorageType === STORAGE_TYPES.cookie
-          ? '删除失败：未删掉匹配的 cookie。请确认上方 Path/Domain（同名多 Path 时需精确匹配）'
+          ? '删除失败：未删掉匹配的 cookie。请核对该行 Path/Domain/分区徽章后重试'
           : '删除失败：key 仍存在';
       setStatus(failTip, 'error');
       return;
@@ -5054,6 +5064,21 @@ async function handleImportFile(file) {
   let importTargetType = currentStorageType;
   let switchedToCookieForImport = false;
 
+  /**
+   * 业务校验失败：提示并视情况回刷（避免同函数 throw 再被 catch）
+   * @param {string} message
+   */
+  const abortImportWithError = async (message) => {
+    setStatus(message, 'error');
+    if (switchedToCookieForImport) {
+      try {
+        await refreshAndRenderTable();
+      } catch {
+        // 刷新失败时至少保持错误提示
+      }
+    }
+  };
+
   try {
     const text = await file.text();
     let payload = parseImportPayload(text);
@@ -5090,22 +5115,24 @@ async function handleImportFile(file) {
       payload = { ...payload, entries: stripped.entries };
       skippedEmpty = stripped.skipped;
       if (!Object.keys(payload.entries).length) {
-        throw new Error(
+        await abortImportWithError(
           skippedEmpty.length
             ? `${formatEmptyValueKeysTip(skippedEmpty)}；文件中没有其它可导入条目`
             : '导入内容为空'
         );
+        return;
       }
     } else if (payload.mode === 'cookieDetails') {
       const stripped = omitEmptyCookieValues(payload.cookies);
       payload = { ...payload, cookies: stripped.cookies };
       skippedEmpty = stripped.skipped;
       if (!payload.cookies.length) {
-        throw new Error(
+        await abortImportWithError(
           skippedEmpty.length
             ? `${formatEmptyValueKeysTip(skippedEmpty)}；文件中没有其它可导入条目`
             : '导入 cookies 详情为空'
         );
+        return;
       }
     }
 
@@ -5126,7 +5153,8 @@ async function handleImportFile(file) {
     }
 
     if (currentStorageType !== importTargetType) {
-      throw new Error('导入期间存储类型已变化，已取消');
+      await abortImportWithError('导入期间存储类型已变化，已取消');
+      return;
     }
 
     let preview;
@@ -5164,7 +5192,8 @@ async function handleImportFile(file) {
     }
 
     if (currentStorageType !== importTargetType) {
-      throw new Error('导入期间存储类型已变化，已取消');
+      await abortImportWithError('导入期间存储类型已变化，已取消');
+      return;
     }
 
     setStatus('导入中...');
@@ -5185,7 +5214,8 @@ async function handleImportFile(file) {
         null,
       ]);
     } else {
-      throw new Error('当前类型不支持 cookies 详情导入，请切换到 cookie');
+      await abortImportWithError('当前类型不支持 cookies 详情导入，请切换到 cookie');
+      return;
     }
 
     await refreshAndRenderTable();
@@ -5644,7 +5674,7 @@ async function initPopup() {
     openFilterDropdown();
   });
   keysFilterInput.addEventListener('blur', () => {
-    void pushFilterHistory(keysFilterInput.value);
+    // 历史仅在 Enter / 选中建议时写入，避免半截输入污染「最近筛选」
     scheduleFilterDropdownClose(150);
   });
   keysFilterInput.addEventListener('keydown', (event) => {
