@@ -123,7 +123,8 @@ body {
   left: 0;
   right: 0;
   z-index: 40;
-  max-height: 220px;
+  /* 约为插件整体高度的 80%，便于一次浏览更多备选 */
+  max-height: calc(var(--popup-max-height) * 0.8);
   overflow: auto;
   border: 1px solid #e2e8f0;
   border-radius: 8px;

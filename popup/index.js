@@ -68,6 +68,7 @@ const jsonPasteBtn = document.getElementById('jsonPasteBtn');
 const jsonClearBtn = document.getElementById('jsonClearBtn');
 const jsonSaveBtn = document.getElementById('jsonSaveBtn');
 const jsonDeleteBtn = document.getElementById('jsonDeleteBtn');
+const jsonCloseBtn = document.getElementById('jsonCloseBtn');
 
 /** @type {string} */
 let currentStorageType = DEFAULT_STORAGE_TYPE;
@@ -715,7 +716,9 @@ function serializePartitionKeyPart(partitionKey) {
 function buildCookieCacheKey(cookie) {
   const name = cookie.name || '';
   const path = cookie.path || '/';
-  const domainPart = cookie.hostOnly ? '' : String(cookie.domain || '');
+  const domainPart = cookie.hostOnly
+    ? ''
+    : String(cookie.domain || '').replace(/^\./, '');
   const partitionPart = serializePartitionKeyPart(cookie.partitionKey);
   return `${name}\u0001${path}\u0001${domainPart}\u0001${partitionPart}`;
 }
@@ -858,9 +861,11 @@ function buildPartitionKeyField(cookie) {
  * __Host- / __Secure- 前缀 cookie 的强制约束
  * @param {string} key
  * @param {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string, httpOnly: boolean, expirationDate?: number | null }} options
+ * @param {{ applySideEffects?: boolean }} [enforceOptions]
  * @returns {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string, httpOnly: boolean, expirationDate?: number | null, prefixTip: string }}
  */
-function enforceCookieNamePrefixRules(key, options) {
+function enforceCookieNamePrefixRules(key, options, enforceOptions = {}) {
+  const { applySideEffects = true } = enforceOptions;
   const next = { ...options, prefixTip: '' };
   if (key.startsWith('__Host-')) {
     // RFC：必须 Secure、Path=/、且不能带 Domain
@@ -868,13 +873,17 @@ function enforceCookieNamePrefixRules(key, options) {
     next.path = '/';
     next.domain = '';
     next.prefixTip = '__Host- 前缀已强制 Secure、Path=/、无 Domain';
-    cookieSecureCheckbox.checked = true;
-    cookiePathInput.value = '/';
-    cookieDomainInput.value = '';
+    if (applySideEffects) {
+      cookieSecureCheckbox.checked = true;
+      cookiePathInput.value = '/';
+      cookieDomainInput.value = '';
+    }
   } else if (key.startsWith('__Secure-')) {
     next.secure = true;
     next.prefixTip = '__Secure- 前缀已强制 Secure';
-    cookieSecureCheckbox.checked = true;
+    if (applySideEffects) {
+      cookieSecureCheckbox.checked = true;
+    }
   }
   return next;
 }
@@ -1269,14 +1278,19 @@ async function writeCookieViaApi(tab, key, value, options, conflictMode = 'upser
   await ensureCookieHostPermission(tab.url || '');
   const storeId = tab.id ? await getTabCookieStoreId(tab.id) : undefined;
 
-  const normalizedOptions = enforceCookieNamePrefixRules(key, options);
+  const applyFormSideEffects = options?.applySideEffects !== false;
+  const normalizedOptions = enforceCookieNamePrefixRules(key, options, {
+    applySideEffects: applyFormSideEffects,
+  });
   let sameSite = mapSameSiteToApi(normalizedOptions.sameSite);
   let secure = Boolean(normalizedOptions.secure);
   const httpOnly = Boolean(normalizedOptions.httpOnly);
 
   if (sameSite === 'no_restriction') {
     secure = true;
-    cookieSecureCheckbox.checked = true;
+    if (applyFormSideEffects) {
+      cookieSecureCheckbox.checked = true;
+    }
   }
 
   const nextPath = normalizedOptions.path || '/';
@@ -1368,7 +1382,9 @@ async function writeCookieViaApi(tab, key, value, options, conflictMode = 'upser
   const attributeMismatch = actualHttpOnly !== httpOnly || actualSecure !== secure;
 
   cookieDetailCache[buildCookieCacheKey(result)] = result;
-  applyCookieDetailsToForm(result);
+  if (applyFormSideEffects) {
+    applyCookieDetailsToForm(result);
+  }
 
   if (attributeMismatch) {
     return {
@@ -1588,7 +1604,10 @@ async function writeCookiesBatchViaApi(tab, entries, options) {
   for (const [key, rawValue] of entryList) {
     const value = rawValue == null ? '' : String(rawValue);
     try {
-      const result = await writeCookieViaApi(tab, key, value, options);
+      const result = await writeCookieViaApi(tab, key, value, {
+        ...options,
+        applySideEffects: false,
+      });
       if (result.success) {
         successCount += 1;
       } else {
@@ -1628,6 +1647,7 @@ async function writeCookiesDetailedBatchViaApi(tab, cookieItems) {
           maxAge: item.maxAge,
           expirationDate: item.expirationDate,
           partitionKey: item.partitionKey,
+          applySideEffects: false,
         },
         'upsert-identity'
       );
@@ -2165,9 +2185,10 @@ function openAllJsonDialog(mode) {
 }
 
 /**
- * 点击遮罩关闭 JSON 弹窗（编辑态有改动时先确认）
+ * 尝试关闭 JSON 弹窗（编辑态有改动时先确认）
+ * @returns {Promise<boolean>} 是否已关闭
  */
-async function handleJsonDialogBackdropClose() {
+async function handleJsonDialogCloseRequest() {
   if (
     jsonDialogMode === 'edit' &&
     jsonDialogEditor.value !== jsonDialogBaselineText
@@ -2179,10 +2200,18 @@ async function handleJsonDialogBackdropClose() {
       danger: true,
     });
     if (!confirmed) {
-      return;
+      return false;
     }
   }
   closeJsonDialog();
+  return true;
+}
+
+/**
+ * 点击遮罩关闭 JSON 弹窗
+ */
+async function handleJsonDialogBackdropClose() {
+  await handleJsonDialogCloseRequest();
 }
 
 /**
@@ -2474,6 +2503,14 @@ async function handleJsonDialogApplyAll() {
     return;
   }
 
+  if (isCookieBarDirtyForActiveRow()) {
+    const canDiscard = await confirmDiscardDirtyEdits('写入全部');
+    if (!canDiscard) {
+      setStatus('已取消写入全部', 'empty');
+      return;
+    }
+  }
+
   setBusy(true);
   try {
     /** @type {{ mode: 'entries', entries: Record<string, string> } | { mode: 'cookieDetails', cookies: NonNullable<ReturnType<typeof normalizeImportedCookieItem>>[] }} */
@@ -2669,15 +2706,18 @@ function handleJsonDialogClear() {
 }
 
 /**
- * 弹窗「删除」：关闭弹窗后删除当前行对应存储
+ * 弹窗「删除」：确认并删除成功后再关窗
  */
 async function handleJsonDialogDelete() {
   if (jsonDialogMode !== 'edit' || jsonDialogScope !== 'row' || !jsonDialogRowId) {
     return;
   }
   const rowId = jsonDialogRowId;
-  closeJsonDialog();
   await handleRowDelete(rowId);
+  // 删除成功后行通常已不在；若弹窗仍开着且目标行已没了则关闭
+  if (!tableRows.some((row) => row.rowId === rowId)) {
+    closeJsonDialog();
+  }
 }
 
 function normalizeHistoryList(list) {
@@ -3631,7 +3671,24 @@ async function applyKeysFilterKeyword(keyword, options = {}) {
   if (activeRowId && !visibleRows.some((row) => row.rowId === activeRowId)) {
     const nextId = visibleRows[0]?.rowId || null;
     const previousActiveId = activeRowId;
-    // 筛选切行跳过属性确认，避免打字时弹窗；取消时也保留当前筛选关键字
+    const previousKeyword = nextKeyword;
+    // 属性栏有未保存改动时先确认，避免筛选静默冲掉
+    if (isCookieBarDirtyForActiveRow()) {
+      const canDiscard = await confirmDiscardDirtyEdits('筛选');
+      if (seq !== filterInputSeq) {
+        return;
+      }
+      if (!canDiscard) {
+        // 取消：清空筛选以继续编辑当前行属性
+        keysFilterInput.value = '';
+        filterKeyword = '';
+        filterInputSeq += 1;
+        syncFilterClearButton();
+        renderStorageTable();
+        void setActiveRow(previousActiveId, { syncCookie: false, skipAttrConfirm: true });
+        return;
+      }
+    }
     const switched = await setActiveRow(nextId, { syncCookie: true, skipAttrConfirm: true });
     if (seq !== filterInputSeq) {
       return;
@@ -3640,6 +3697,7 @@ async function applyKeysFilterKeyword(keyword, options = {}) {
       void setActiveRow(previousActiveId, { syncCookie: false, skipAttrConfirm: true });
       return;
     }
+    void previousKeyword;
   } else if (activeRowId) {
     void setActiveRow(activeRowId, { syncCookie: false, skipAttrConfirm: true });
   }
@@ -4408,17 +4466,19 @@ async function handleRowSave(rowId) {
 
   const textarea = getRowValueTextarea(rowId);
   if (!textarea) {
-    return false;
-  }
-
-  if (!textarea.value) {
+    // 行可能被筛选隐藏：用模型值继续，避免静默失败
+    if (!row.value) {
+      setStatus('没有可写入的值（行可能被筛选隐藏且值为空）', 'error');
+      return false;
+    }
+  } else if (!textarea.value) {
     setStatus('请先粘贴或输入要写入的值（空字符串拒绝写入）', 'error');
     textarea.focus();
     return false;
   }
 
   ensureFormatBoundToRow(rowId);
-  const prepared = prepareValueForWrite(textarea.value);
+  const prepared = prepareValueForWrite(textarea ? textarea.value : row.value);
   const value = prepared.text;
   const keptEditsOnWrite = formatExpandDirty && prepared.restoredCount > 0;
 
@@ -4682,21 +4742,9 @@ async function handleRowSave(rowId) {
       if (pageData.prefixTip) {
         failTip += `（${pageData.prefixTip}）`;
       }
-      // 新 identity 已落盘时仍删旧，避免 success=false 留下新旧双份
-      if (cookieIdentityChanged && oldCookieDetail && pageData.cookie) {
-        await chrome.cookies.remove({
-          url: buildCookieUrl(oldCookieDetail, tab),
-          name: oldCookieDetail.name,
-          storeId: oldCookieDetail.storeId,
-          ...buildPartitionKeyField(oldCookieDetail),
-        });
-        const oldCacheKey = buildCookieCacheKey(oldCookieDetail);
-        const stillExists = (await collectTabCookies(tab)).some(
-          (cookie) => buildCookieCacheKey(cookie) === oldCacheKey
-        );
-        failTip += stillExists
-          ? '；旧 identity 仍在，请手动删除以免双份。'
-          : '；已删除旧 identity，请核对新条目属性。';
+      // 软失败保留旧 identity，避免「属性/值不符却已删掉原 Cookie」
+      if (cookieIdentityChanged && pageData.cookie) {
+        failTip += '；新条目可能已写入，旧条目仍保留。请刷新后核对，必要时手动删除多余项。';
       }
       setStatus(failTip, 'error');
       await refreshAndRenderTable({
@@ -5153,6 +5201,13 @@ async function handleImportFile(file) {
     }
   } catch (error) {
     setStatus(error instanceof Error ? error.message : '导入失败', 'error');
+    if (switchedToCookieForImport) {
+      try {
+        await refreshAndRenderTable();
+      } catch {
+        // 刷新失败时至少保持错误提示
+      }
+    }
   } finally {
     setBusy(false);
     importFileInput.value = '';
@@ -5723,6 +5778,17 @@ async function initPopup() {
   jsonDeleteBtn.addEventListener('click', (event) => {
     event.preventDefault();
     handleJsonDialogDelete();
+  });
+  if (jsonCloseBtn instanceof HTMLButtonElement) {
+    jsonCloseBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      void handleJsonDialogCloseRequest();
+    });
+  }
+  jsonDialog.addEventListener('cancel', (event) => {
+    // Esc：拦截默认关闭，走同一套未保存确认
+    event.preventDefault();
+    void handleJsonDialogCloseRequest();
   });
   jsonDialog.addEventListener('close', () => {
     jsonDialogRowId = null;
