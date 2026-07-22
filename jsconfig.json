@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "node",
+    "checkJs": false,
+    "noEmit": true,
+    "types": ["chrome"]
+  },
+  "include": ["popup/**/*.js", "background/**/*.js", "**/*.d.ts"],
+  "exclude": ["node_modules"]
+}

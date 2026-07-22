@@ -4,11 +4,16 @@
   padding: 0;
 }
 
+:root {
+  /* 与 JS applyPopupMaxHeight 对齐；未注入前作为回退 */
+  --popup-max-height: 600px;
+}
+
 html,
 body {
   width: 800px;
   height: auto;
-  max-height: var(--popup-max-height, 600px);
+  max-height: var(--popup-max-height);
   overflow: hidden;
   border-radius: 3px;
 }

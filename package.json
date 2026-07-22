@@ -1,0 +1,8 @@
+{
+  "name": "browser-extension",
+  "private": true,
+  "description": "应用存储管理 Chrome 扩展（开发类型声明）",
+  "devDependencies": {
+    "@types/chrome": "^0.2.2"
+  }
+}

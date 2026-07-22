@@ -2303,7 +2303,7 @@ async function handleJsonDialogPaste() {
       clearFormatStateForUi();
     }
     jsonDialogEditor.value = text;
-    let isJson = false;
+    let isJson;
     try {
       JSON.parse(text.trim());
       isJson = true;
@@ -2442,7 +2442,7 @@ async function handleJsonDialogApplyAll() {
   /** @type {string} */
   let cookieTip = '';
   /** @type {string[]} */
-  let skippedEmpty = [];
+  let skippedEmpty;
 
   if (payload.mode === 'cookieDetails') {
     const stripped = omitEmptyCookieValues(payload.cookies);
@@ -2560,8 +2560,7 @@ async function handleJsonDialogSave() {
     return;
   }
 
-  const rowId = jsonDialogRowId;
-  if (!rowId) {
+  if (!jsonDialogRowId) {
     setStatus('没有可保存的行', 'error');
     return;
   }
@@ -2931,7 +2930,7 @@ function extractBalancedJsonFragment(text) {
 
   // 兼容 var config = {...}; / let/const config = {...}
   const assignMatch = sourceText.match(
-    /(?:var|let|const)\s+[A-Za-z_$][\w$]*\s*=\s*(\{[\s\S]*\}|\[[\s\S]*\])\s*;?\s*$/
+    /(?:var|let|const)\s+[A-Za-z_$][\w$]*\s*=\s*(\{[\s\S]*}|\[[\s\S]*])\s*;?\s*$/
   );
   if (assignMatch && assignMatch.index != null) {
     const jsonText = assignMatch[1];
@@ -4902,8 +4901,8 @@ async function handleImportFile(file) {
       throw new Error('导入期间存储类型已变化，已取消');
     }
 
-    let preview = '';
-    let totalCount = 0;
+    let preview;
+    let totalCount;
     if (payload.mode === 'cookieDetails') {
       totalCount = payload.cookies.length;
       preview = payload.cookies
@@ -5544,7 +5543,7 @@ async function initPopup() {
     if (formatBoundRowId && formatTargetId && formatBoundRowId === formatTargetId && formatExpandActive) {
       formatExpandDirty = true;
     }
-    let isJson = false;
+    let isJson;
     try {
       JSON.parse(jsonDialogEditor.value.trim());
       isJson = true;
