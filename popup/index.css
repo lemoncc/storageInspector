@@ -33,7 +33,6 @@ body {
 .header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
   flex-shrink: 0;
 }
@@ -43,7 +42,7 @@ body {
   font-weight: 600;
   color: #0f172a;
   line-height: 1.4;
-  min-width: 0;
+  flex-shrink: 0;
   white-space: nowrap;
 }
 
@@ -53,13 +52,18 @@ body {
   gap: 4px;
   min-width: 0;
   flex: 1;
-  justify-content: flex-end;
+}
+
+.header-toolbar .btn {
+  flex-shrink: 0;
 }
 
 .keys-filter {
-  width: 120px;
+  flex: 1;
+  min-width: 120px;
   height: 28px;
   padding: 0 8px;
+  margin-right: 4px;
   border: 1px solid #cbd5e1;
   border-radius: 5px;
   background: #ffffff;
@@ -101,6 +105,11 @@ body {
 .tab-item:hover {
   background: #f1f5f9;
   color: #334155;
+}
+
+.tab-item:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .tab-item.is-active {
@@ -271,6 +280,14 @@ select.cookie-control {
   background: #fffbeb;
 }
 
+.storage-table tbody tr.is-dirty:not(.is-draft) {
+  background: #fff7ed;
+}
+
+.storage-table tbody tr.is-dirty.is-active:not(.is-draft) {
+  background: #ffedd5;
+}
+
 .storage-table tbody tr.is-draft.is-active {
   background: #fef3c7;
 }
@@ -353,9 +370,19 @@ select.cookie-control {
   color: #065f46;
 }
 
+.row-badge.is-partition {
+  background: #e0e7ff;
+  color: #3730a3;
+}
+
 .row-badge.is-draft {
   background: #ffedd5;
   color: #9a3412;
+}
+
+.row-badge.is-dirty {
+  background: #ffedd5;
+  color: #c2410c;
 }
 
 .row-value {
@@ -411,17 +438,19 @@ select.cookie-control {
   min-width: 88px;
   height: 30px;
   font-size: 13px;
+  flex-shrink: 0;
 }
 
 .status {
   flex: 1;
   min-width: 0;
+  max-height: 52px;
   font-size: 12px;
-  line-height: 1.4;
+  line-height: 30px;
   color: #64748b;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .status.is-success {
@@ -430,6 +459,9 @@ select.cookie-control {
 
 .status.is-error {
   color: #dc2626;
+  line-height: 1.4;
+  padding-top: 4px;
+  padding-bottom: 4px;
 }
 
 .status.is-empty {
