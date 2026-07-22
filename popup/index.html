@@ -11,17 +11,36 @@
       <header class="header">
         <h1 class="title">应用存储管理</h1>
         <div class="header-toolbar">
-          <input
-            id="keysFilterInput"
-            class="keys-filter"
-            type="text"
-            list="keysFilterSuggestions"
-            placeholder="筛选 key / 值"
-            spellcheck="false"
-            autocomplete="off"
-            aria-label="筛选 Key 或值"
-          />
-          <datalist id="keysFilterSuggestions"></datalist>
+          <div class="keys-filter-wrap">
+            <input
+              id="keysFilterInput"
+              class="keys-filter"
+              type="text"
+              placeholder="筛选 key / 值"
+              spellcheck="false"
+              autocomplete="off"
+              role="combobox"
+              aria-autocomplete="list"
+              aria-controls="keysFilterDropdown"
+              aria-expanded="false"
+              aria-label="筛选 Key 或值"
+            />
+            <button
+              id="keysFilterClearBtn"
+              class="keys-filter-clear"
+              type="button"
+              aria-label="清除筛选"
+              hidden
+            >
+              ×
+            </button>
+            <div
+              id="keysFilterDropdown"
+              class="keys-filter-dropdown"
+              role="listbox"
+              hidden
+            ></div>
+          </div>
           <button id="refreshKeysBtn" class="btn btn-ghost" type="button">刷新</button>
           <button id="viewAllJsonBtn" class="btn btn-ghost" type="button">查看</button>
           <button id="editAllJsonBtn" class="btn btn-ghost" type="button">编辑</button>

@@ -29,7 +29,9 @@ const BLOCKED_URL_PREFIXES = [
 
 const storageTypeTabsEl = document.getElementById('storageTypeTabs');
 const keysFilterInput = document.getElementById('keysFilterInput');
-const keysFilterSuggestions = document.getElementById('keysFilterSuggestions');
+const keysFilterClearBtn = document.getElementById('keysFilterClearBtn');
+const keysFilterDropdown = document.getElementById('keysFilterDropdown');
+const keysFilterWrap = keysFilterInput?.closest('.keys-filter-wrap') || null;
 const refreshKeysBtn = document.getElementById('refreshKeysBtn');
 const viewAllJsonBtn = document.getElementById('viewAllJsonBtn');
 const editAllJsonBtn = document.getElementById('editAllJsonBtn');
@@ -107,6 +109,14 @@ let filterKeyword = '';
 let filterHistoryCache = [];
 /** 筛选 input 序号，丢弃过期的异步回调 */
 let filterInputSeq = 0;
+/** 筛选下拉是否展开 */
+let filterDropdownOpen = false;
+/** 筛选下拉当前高亮项索引（-1 表示无） */
+let filterDropdownActiveIndex = -1;
+/** 筛选下拉当前可选项（扁平，用于键盘导航） */
+let filterDropdownFlatOptions = [];
+/** 失焦关闭下拉的延时句柄 */
+let filterDropdownBlurTimer = 0;
 
 /**
  * 递归格式化还原表：路径 -> { prefix, suffix, original }
@@ -3190,6 +3200,12 @@ function setBusy(busy) {
   clearAllBtn.disabled = busy;
   addRowBtn.disabled = busy;
   keysFilterInput.disabled = busy;
+  if (keysFilterClearBtn instanceof HTMLButtonElement) {
+    keysFilterClearBtn.disabled = busy;
+  }
+  if (busy) {
+    closeFilterDropdown();
+  }
   // Cookie 属性栏一并锁定，避免写入中改表单
   [
     cookiePathInput,
@@ -3313,44 +3329,247 @@ function collectCurrentTableKeysForFilter() {
 }
 
 /**
- * 刷新筛选框 datalist：历史（最多 5）+ 当前 tab 全部 key
+ * 同步清除按钮显隐
  */
-function refreshFilterSuggestions() {
-  if (!(keysFilterSuggestions instanceof HTMLDataListElement)) {
+function syncFilterClearButton() {
+  if (!(keysFilterClearBtn instanceof HTMLButtonElement) || !(keysFilterInput instanceof HTMLInputElement)) {
     return;
   }
+  keysFilterClearBtn.hidden = !keysFilterInput.value;
+}
+
+/**
+ * 构建筛选下拉数据：历史 + 当前 key（完整备选，不随输入过滤）
+ * @returns {{ history: string[], keys: string[], flat: Array<{ kind: string, value: string }> }}
+ */
+function buildFilterSuggestionGroups() {
   const seen = new Set();
-  const options = [];
+  const history = [];
   for (const item of filterHistoryCache) {
     if (seen.has(item)) {
       continue;
     }
     seen.add(item);
-    options.push(item);
+    history.push(item);
   }
+  const keys = [];
   for (const keyText of collectCurrentTableKeysForFilter()) {
     if (seen.has(keyText)) {
       continue;
     }
     seen.add(keyText);
-    options.push(keyText);
+    keys.push(keyText);
   }
-  keysFilterSuggestions.innerHTML = options
-    .map((value) => `<option value="${escapeHtml(value)}"></option>`)
-    .join('');
+  const flat = [
+    ...history.map((value) => ({ kind: 'history', value })),
+    ...keys.map((value) => ({ kind: 'key', value })),
+  ];
+  return { history, keys, flat };
 }
 
 /**
- * 恢复当前类型的默认筛选：最后一次历史，没有则空
+ * 刷新筛选下拉 DOM（不强制展开）
+ */
+function refreshFilterSuggestions() {
+  if (!(keysFilterDropdown instanceof HTMLElement)) {
+    return;
+  }
+  const groups = buildFilterSuggestionGroups();
+  filterDropdownFlatOptions = groups.flat;
+
+  if (!groups.flat.length) {
+    keysFilterDropdown.innerHTML = `<div class="keys-filter-empty">暂无备选</div>`;
+    filterDropdownActiveIndex = -1;
+    return;
+  }
+
+  const parts = [];
+  let flatIndex = 0;
+  if (groups.history.length) {
+    parts.push(`<div class="keys-filter-group-label">最近筛选</div>`);
+    groups.history.forEach((value) => {
+      parts.push(
+        `<button type="button" class="keys-filter-option" role="option" data-index="${flatIndex}" data-kind="history" title="${escapeHtml(value)}">${escapeHtml(value)}</button>`
+      );
+      flatIndex += 1;
+    });
+  }
+  if (groups.keys.length) {
+    parts.push(`<div class="keys-filter-group-label">当前 Key</div>`);
+    groups.keys.forEach((value) => {
+      parts.push(
+        `<button type="button" class="keys-filter-option" role="option" data-index="${flatIndex}" data-kind="key" title="${escapeHtml(value)}">${escapeHtml(value)}</button>`
+      );
+      flatIndex += 1;
+    });
+  }
+  keysFilterDropdown.innerHTML = parts.join('');
+
+  if (filterDropdownActiveIndex >= filterDropdownFlatOptions.length) {
+    filterDropdownActiveIndex = filterDropdownFlatOptions.length - 1;
+  }
+  syncFilterDropdownActiveOption();
+}
+
+/**
+ * 同步下拉高亮样式与滚动
+ */
+function syncFilterDropdownActiveOption() {
+  if (!(keysFilterDropdown instanceof HTMLElement)) {
+    return;
+  }
+  const options = Array.from(keysFilterDropdown.querySelectorAll('.keys-filter-option'));
+  options.forEach((el, index) => {
+    el.classList.toggle('is-active', index === filterDropdownActiveIndex);
+  });
+  const activeEl = options[filterDropdownActiveIndex];
+  if (activeEl instanceof HTMLElement) {
+    activeEl.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+/**
+ * 取消待执行的下拉关闭
+ */
+function cancelFilterDropdownClose() {
+  window.clearTimeout(filterDropdownBlurTimer);
+  filterDropdownBlurTimer = 0;
+}
+
+/**
+ * 延后关闭下拉（便于移入下拉或再次点输入框）
+ * @param {number} [delayMs]
+ */
+function scheduleFilterDropdownClose(delayMs = 150) {
+  cancelFilterDropdownClose();
+  filterDropdownBlurTimer = window.setTimeout(() => {
+    // 指针仍在筛选区域内则不关
+    if (keysFilterWrap instanceof HTMLElement && keysFilterWrap.matches(':hover')) {
+      return;
+    }
+    closeFilterDropdown();
+  }, delayMs);
+}
+
+/**
+ * 展开筛选下拉
+ */
+function openFilterDropdown() {
+  if (!(keysFilterDropdown instanceof HTMLElement) || isBusy) {
+    return;
+  }
+  cancelFilterDropdownClose();
+  refreshFilterSuggestions();
+  filterDropdownOpen = true;
+  keysFilterDropdown.hidden = false;
+  if (keysFilterWrap instanceof HTMLElement) {
+    keysFilterWrap.classList.add('is-open');
+  }
+  if (keysFilterInput instanceof HTMLInputElement) {
+    keysFilterInput.setAttribute('aria-expanded', 'true');
+  }
+  if (filterDropdownActiveIndex < 0 && filterDropdownFlatOptions.length) {
+    filterDropdownActiveIndex = 0;
+    syncFilterDropdownActiveOption();
+  }
+}
+
+/**
+ * 收起筛选下拉
+ */
+function closeFilterDropdown() {
+  cancelFilterDropdownClose();
+  filterDropdownOpen = false;
+  filterDropdownActiveIndex = -1;
+  if (keysFilterDropdown instanceof HTMLElement) {
+    keysFilterDropdown.hidden = true;
+  }
+  if (keysFilterWrap instanceof HTMLElement) {
+    keysFilterWrap.classList.remove('is-open');
+  }
+  if (keysFilterInput instanceof HTMLInputElement) {
+    keysFilterInput.setAttribute('aria-expanded', 'false');
+  }
+}
+
+/**
+ * 应用筛选关键字并刷新表格
+ * @param {string} keyword
+ * @param {{ pushHistory?: boolean, closeDropdown?: boolean }} [options]
+ */
+async function applyKeysFilterKeyword(keyword, options = {}) {
+  const { pushHistory = false, closeDropdown = true } = options;
+  if (!(keysFilterInput instanceof HTMLInputElement)) {
+    return;
+  }
+  const nextKeyword = String(keyword ?? '');
+  keysFilterInput.value = nextKeyword;
+  filterKeyword = nextKeyword;
+  syncFilterClearButton();
+  if (closeDropdown) {
+    closeFilterDropdown();
+  } else {
+    refreshFilterSuggestions();
+  }
+
+  const seq = ++filterInputSeq;
+  tableRows.forEach((row) => syncRowModelFromDom(row.rowId));
+  renderStorageTable();
+  const visibleRows = tableRows.filter(isRowMatchFilter);
+  if (activeRowId && !visibleRows.some((row) => row.rowId === activeRowId)) {
+    const nextId = visibleRows[0]?.rowId || null;
+    const previousActiveId = activeRowId;
+    const switched = await setActiveRow(nextId, { syncCookie: true });
+    if (seq !== filterInputSeq) {
+      return;
+    }
+    if (!switched) {
+      keysFilterInput.value = '';
+      filterKeyword = '';
+      filterInputSeq += 1;
+      syncFilterClearButton();
+      renderStorageTable();
+      void setActiveRow(previousActiveId, { syncCookie: false, skipAttrConfirm: true });
+      return;
+    }
+  } else if (activeRowId) {
+    void setActiveRow(activeRowId, { syncCookie: false, skipAttrConfirm: true });
+  }
+
+  if (pushHistory) {
+    void pushFilterHistory(nextKeyword);
+  }
+}
+
+/**
+ * 选中下拉某一项
+ * @param {string} value
+ */
+function selectFilterSuggestion(value) {
+  void applyKeysFilterKeyword(value, { pushHistory: true, closeDropdown: true });
+}
+
+/**
+ * 清除筛选
+ */
+function clearKeysFilter() {
+  void applyKeysFilterKeyword('', { pushHistory: false, closeDropdown: true });
+  if (keysFilterInput instanceof HTMLInputElement) {
+    keysFilterInput.focus();
+  }
+}
+
+/**
+ * 恢复筛选框为空，并加载当前类型的筛选历史备选
  * @returns {Promise<void>}
  */
 async function restoreDefaultFilterKeyword() {
   await loadFilterHistoryCache();
-  const lastKeyword = filterHistoryCache[0] || '';
-  filterKeyword = lastKeyword;
+  filterKeyword = '';
   if (keysFilterInput instanceof HTMLInputElement) {
-    keysFilterInput.value = lastKeyword;
+    keysFilterInput.value = '';
   }
+  syncFilterClearButton();
   refreshFilterSuggestions();
 }
 
@@ -5155,42 +5374,126 @@ async function initPopup() {
 
   refreshKeysBtn.addEventListener('click', handleRefresh);
   keysFilterInput.addEventListener('input', () => {
-    const seq = ++filterInputSeq;
-    const keywordSnapshot = keysFilterInput.value;
-    void (async () => {
-      filterKeyword = keywordSnapshot;
-      tableRows.forEach((row) => syncRowModelFromDom(row.rowId));
-      if (seq !== filterInputSeq) {
+    syncFilterClearButton();
+    void applyKeysFilterKeyword(keysFilterInput.value, {
+      pushHistory: false,
+      closeDropdown: false,
+    });
+    openFilterDropdown();
+  });
+  // 悬停即展开（输入框已聚焦时 focus 不会再触发）
+  if (keysFilterWrap instanceof HTMLElement) {
+    keysFilterWrap.addEventListener('mouseenter', () => {
+      openFilterDropdown();
+    });
+    keysFilterWrap.addEventListener('mouseleave', () => {
+      if (document.activeElement === keysFilterInput) {
         return;
       }
-      renderStorageTable();
-      const visibleRows = tableRows.filter(isRowMatchFilter);
-      if (activeRowId && !visibleRows.some((row) => row.rowId === activeRowId)) {
-        const nextId = visibleRows[0]?.rowId || null;
-        const previousActiveId = activeRowId;
-        const switched = await setActiveRow(nextId, { syncCookie: true });
-        if (seq !== filterInputSeq) {
-          return;
-        }
-        if (!switched) {
-          // 取消：恢复该次筛选前的关键字意图（清空筛选以继续编辑）
-          keysFilterInput.value = '';
-          filterKeyword = '';
-          filterInputSeq += 1;
-          renderStorageTable();
-          void setActiveRow(previousActiveId, { syncCookie: false, skipAttrConfirm: true });
-        }
-      } else if (activeRowId) {
-        void setActiveRow(activeRowId, { syncCookie: false, skipAttrConfirm: true });
-      }
-    })();
+      scheduleFilterDropdownClose(120);
+    });
+  }
+  keysFilterInput.addEventListener('focus', () => {
+    openFilterDropdown();
   });
-  // 选中备选或失焦时写入筛选历史
-  keysFilterInput.addEventListener('change', () => {
-    void pushFilterHistory(keysFilterInput.value);
+  // 已聚焦时再次点击也要能打开（Esc / 选中后收起的场景）
+  keysFilterInput.addEventListener('mousedown', () => {
+    openFilterDropdown();
+  });
+  keysFilterInput.addEventListener('click', () => {
+    openFilterDropdown();
   });
   keysFilterInput.addEventListener('blur', () => {
     void pushFilterHistory(keysFilterInput.value);
+    scheduleFilterDropdownClose(150);
+  });
+  keysFilterInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      if (filterDropdownOpen) {
+        event.preventDefault();
+        closeFilterDropdown();
+      }
+      return;
+    }
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      if (!filterDropdownOpen) {
+        openFilterDropdown();
+      }
+      if (!filterDropdownFlatOptions.length) {
+        return;
+      }
+      filterDropdownActiveIndex =
+        (filterDropdownActiveIndex + 1 + filterDropdownFlatOptions.length) %
+        filterDropdownFlatOptions.length;
+      syncFilterDropdownActiveOption();
+      return;
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (!filterDropdownOpen) {
+        openFilterDropdown();
+      }
+      if (!filterDropdownFlatOptions.length) {
+        return;
+      }
+      filterDropdownActiveIndex =
+        (filterDropdownActiveIndex - 1 + filterDropdownFlatOptions.length) %
+        filterDropdownFlatOptions.length;
+      syncFilterDropdownActiveOption();
+      return;
+    }
+    if (event.key === 'Enter' && filterDropdownOpen && filterDropdownActiveIndex >= 0) {
+      const active = filterDropdownFlatOptions[filterDropdownActiveIndex];
+      if (active) {
+        event.preventDefault();
+        selectFilterSuggestion(active.value);
+      }
+    }
+  });
+  if (keysFilterDropdown instanceof HTMLElement) {
+    keysFilterDropdown.addEventListener('mousedown', (event) => {
+      // 避免点选项时 input blur 抢先关闭
+      event.preventDefault();
+      cancelFilterDropdownClose();
+    });
+    keysFilterDropdown.addEventListener('click', (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) {
+        return;
+      }
+      const option = target.closest('.keys-filter-option');
+      if (!(option instanceof HTMLElement)) {
+        return;
+      }
+      const index = Number(option.dataset.index);
+      const selected = filterDropdownFlatOptions[index];
+      if (selected) {
+        selectFilterSuggestion(selected.value);
+      }
+    });
+  }
+  if (keysFilterClearBtn instanceof HTMLButtonElement) {
+    keysFilterClearBtn.addEventListener('mousedown', (event) => {
+      event.preventDefault();
+      cancelFilterDropdownClose();
+    });
+    keysFilterClearBtn.addEventListener('click', () => {
+      if (isBusy) {
+        return;
+      }
+      clearKeysFilter();
+    });
+  }
+  document.addEventListener('mousedown', (event) => {
+    if (!filterDropdownOpen || !(keysFilterWrap instanceof HTMLElement)) {
+      return;
+    }
+    const target = event.target;
+    if (target instanceof Node && keysFilterWrap.contains(target)) {
+      return;
+    }
+    closeFilterDropdown();
   });
 
   exportBtn.addEventListener('click', handleExport);
