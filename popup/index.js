@@ -755,6 +755,43 @@ function buildCookieUrl(cookie, tab) {
 }
 
 /**
+ * 构造 remove/set 时附带的 partitionKey（Chrome 119+ 分区 Cookie）
+ * @param {chrome.cookies.Cookie | { partitionKey?: chrome.cookies.CookiePartitionKey } | null | undefined} cookie
+ * @returns {{ partitionKey?: chrome.cookies.CookiePartitionKey }}
+ */
+function buildPartitionKeyField(cookie) {
+  if (cookie && cookie.partitionKey && typeof cookie.partitionKey === 'object') {
+    return { partitionKey: cookie.partitionKey };
+  }
+  return {};
+}
+
+/**
+ * __Host- / __Secure- 前缀 cookie 的强制约束
+ * @param {string} key
+ * @param {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string, httpOnly: boolean, expirationDate?: number | null }} options
+ * @returns {{ path: string, maxAge: number | null, domain: string, secure: boolean, sameSite: string, httpOnly: boolean, expirationDate?: number | null, prefixTip: string }}
+ */
+function enforceCookieNamePrefixRules(key, options) {
+  const next = { ...options, prefixTip: '' };
+  if (key.startsWith('__Host-')) {
+    // RFC：必须 Secure、Path=/、且不能带 Domain
+    next.secure = true;
+    next.path = '/';
+    next.domain = '';
+    next.prefixTip = '__Host- 前缀已强制 Secure、Path=/、无 Domain';
+    cookieSecureCheckbox.checked = true;
+    cookiePathInput.value = '/';
+    cookieDomainInput.value = '';
+  } else if (key.startsWith('__Secure-')) {
+    next.secure = true;
+    next.prefixTip = '__Secure- 前缀已强制 Secure';
+    cookieSecureCheckbox.checked = true;
+  }
+  return next;
+}
+
+/**
  * 将 cookie 详情回填到表单
  * @param {chrome.cookies.Cookie} cookie
  */
@@ -1124,31 +1161,36 @@ async function writeCookieViaApi(tab, key, value, options, conflictMode = 'repla
   await ensureCookieHostPermission(tab.url || '');
   const storeId = tab.id ? await getTabCookieStoreId(tab.id) : undefined;
 
-  let sameSite = mapSameSiteToApi(options.sameSite);
-  let secure = Boolean(options.secure);
-  const httpOnly = Boolean(options.httpOnly);
+  const normalizedOptions = enforceCookieNamePrefixRules(key, options);
+  let sameSite = mapSameSiteToApi(normalizedOptions.sameSite);
+  let secure = Boolean(normalizedOptions.secure);
+  const httpOnly = Boolean(normalizedOptions.httpOnly);
 
   if (sameSite === 'no_restriction') {
     secure = true;
     cookieSecureCheckbox.checked = true;
   }
 
-  const nextPath = options.path || '/';
-  const nextDomainNorm = (options.domain || '').replace(/^\./, '');
+  const nextPath = normalizedOptions.path || '/';
+  const nextDomainNorm = (normalizedOptions.domain || '').replace(/^\./, '');
 
-  // 写入前清理冲突项：
-  // - replace-all-same-name：删掉同名全部（表单单条写入，避免改 Path 残留）
-  // - upsert-identity：只删同 identity（导入多 Path 同名时互不影响）
+  // 写入前清理冲突项，并记住同 identity 的 partitionKey（分区 Cookie 必须带上才能改到同一条）
   const existingCookies = (await collectTabCookies(tab)).filter((cookie) => cookie.name === key);
+  /** @type {chrome.cookies.Cookie | null} */
+  let sameIdentityCookie = null;
   for (const cookie of existingCookies) {
     const oldPath = cookie.path || '/';
     const oldDomainNorm = cookie.hostOnly ? '' : String(cookie.domain || '').replace(/^\./, '');
     const isSameIdentity = oldPath === nextPath && oldDomainNorm === nextDomainNorm;
+    if (isSameIdentity) {
+      sameIdentityCookie = cookie;
+    }
     if (conflictMode === 'replace-all-same-name' || isSameIdentity) {
       await chrome.cookies.remove({
         url: buildCookieUrl(cookie, tab),
         name: key,
         storeId: cookie.storeId,
+        ...buildPartitionKeyField(cookie),
       });
     }
   }
@@ -1161,41 +1203,77 @@ async function writeCookieViaApi(tab, key, value, options, conflictMode = 'repla
     path: nextPath,
     secure,
     httpOnly,
+    ...buildPartitionKeyField(sameIdentityCookie),
   };
 
-  if (options.domain) {
-    details.domain = options.domain;
+  if (normalizedOptions.domain) {
+    details.domain = normalizedOptions.domain;
   }
   if (sameSite) {
     details.sameSite = sameSite;
   }
-  if (options.maxAge !== null && options.maxAge !== undefined && Number.isFinite(options.maxAge)) {
-    details.expirationDate = Date.now() / 1000 + options.maxAge;
+  if (
+    normalizedOptions.maxAge !== null &&
+    normalizedOptions.maxAge !== undefined &&
+    Number.isFinite(normalizedOptions.maxAge)
+  ) {
+    details.expirationDate = Date.now() / 1000 + normalizedOptions.maxAge;
   } else if (
-    options.expirationDate !== null &&
-    options.expirationDate !== undefined &&
-    Number.isFinite(options.expirationDate)
+    normalizedOptions.expirationDate !== null &&
+    normalizedOptions.expirationDate !== undefined &&
+    Number.isFinite(normalizedOptions.expirationDate)
   ) {
     // 沿用读取时的绝对过期时间
-    details.expirationDate = options.expirationDate;
+    details.expirationDate = normalizedOptions.expirationDate;
   }
   if (storeId) {
     details.storeId = storeId;
   }
 
   const result = await chrome.cookies.set(details);
+  const setError = chrome.runtime.lastError?.message || '';
   if (!result) {
-    return { ...routeInfo, value: null, success: false, httpOnly };
+    return {
+      ...routeInfo,
+      value: null,
+      success: false,
+      httpOnly,
+      error: setError || 'chrome.cookies.set 返回空（可能被浏览器拒绝：Secure/SameSite/Domain/前缀规则等）',
+      prefixTip: normalizedOptions.prefixTip,
+    };
   }
+
+  const actualHttpOnly = Boolean(result.httpOnly);
+  const actualSecure = Boolean(result.secure);
+  const attributeMismatch = actualHttpOnly !== httpOnly || actualSecure !== secure;
 
   cookieDetailCache[buildCookieCacheKey(result)] = result;
   applyCookieDetailsToForm(result);
+
+  if (attributeMismatch) {
+    return {
+      ...routeInfo,
+      value: result.value,
+      success: false,
+      httpOnly: actualHttpOnly,
+      cookie: result,
+      attributeMismatch: true,
+      expectedHttpOnly: httpOnly,
+      actualHttpOnly,
+      expectedSecure: secure,
+      actualSecure,
+      prefixTip: normalizedOptions.prefixTip,
+      error: `属性未按预期生效：HttpOnly 期望 ${httpOnly} / 实际 ${actualHttpOnly}，Secure 期望 ${secure} / 实际 ${actualSecure}`,
+    };
+  }
+
   return {
     ...routeInfo,
     value: result.value,
     success: result.value === value,
-    httpOnly: Boolean(result.httpOnly),
+    httpOnly: actualHttpOnly,
     cookie: result,
+    prefixTip: normalizedOptions.prefixTip,
   };
 }
 
@@ -1282,6 +1360,7 @@ async function deleteCookieViaApi(tab, key, options = {}) {
         url: buildCookieUrl(cookie, tab),
         name: key,
         storeId: cookie.storeId,
+        ...buildPartitionKeyField(cookie),
       });
     }
   }
@@ -1298,6 +1377,7 @@ async function deleteCookieViaApi(tab, key, options = {}) {
         url: buildCookieUrl(cookie, tab),
         name: key,
         storeId: cookie.storeId,
+        ...buildPartitionKeyField(cookie),
       });
     }
   }
@@ -3043,7 +3123,10 @@ async function refreshAndRenderTable(options = {}) {
   if (preferKey) {
     const matched = tableRows.find(
       (row) =>
-        (!row.isDraft && (row.key === preferKey || row.originKey === preferKey)) ||
+        (!row.isDraft &&
+          (row.key === preferKey ||
+            row.originKey === preferKey ||
+            row.cacheKey === preferKey)) ||
         (row.isDraft && row.key === preferKey)
     );
     if (matched) {
@@ -3372,8 +3455,45 @@ async function handleRowSave(rowId) {
       }
     } else {
       const existingData = await readExistingForSave(tab, key, row);
+      const cookieOptionsPreview =
+        currentStorageType === STORAGE_TYPES.cookie ? getCookieWriteOptions() : null;
+      const cookieAttrLines = [];
+      if (cookieOptionsPreview && existingData.cookie) {
+        const oldCookie = existingData.cookie;
+        const flag = (yes) => (yes ? '是' : '否');
+        if (Boolean(oldCookie.httpOnly) !== Boolean(cookieOptionsPreview.httpOnly)) {
+          cookieAttrLines.push(
+            `HttpOnly：${flag(oldCookie.httpOnly)} → ${flag(cookieOptionsPreview.httpOnly)}`
+          );
+        }
+        if (Boolean(oldCookie.secure) !== Boolean(cookieOptionsPreview.secure)) {
+          cookieAttrLines.push(
+            `Secure：${flag(oldCookie.secure)} → ${flag(cookieOptionsPreview.secure)}`
+          );
+        }
+        const oldPath = oldCookie.path || '/';
+        if (oldPath !== (cookieOptionsPreview.path || '/')) {
+          cookieAttrLines.push(`Path：${oldPath} → ${cookieOptionsPreview.path || '/'}`);
+        }
+        const oldDomain = oldCookie.hostOnly ? '' : oldCookie.domain || '';
+        if (oldDomain.replace(/^\./, '') !== (cookieOptionsPreview.domain || '').replace(/^\./, '')) {
+          cookieAttrLines.push(
+            `Domain：${oldDomain || '(host-only)'} → ${cookieOptionsPreview.domain || '(host-only)'}`
+          );
+        }
+        const oldSameSite = mapSameSiteFromApi(oldCookie.sameSite);
+        if (oldSameSite !== (cookieOptionsPreview.sameSite || '')) {
+          cookieAttrLines.push(
+            `SameSite：${oldSameSite || '默认'} → ${cookieOptionsPreview.sameSite || '默认'}`
+          );
+        }
+      }
+
       if (existingData.value !== null && existingData.value !== value) {
         let body = `旧值（${existingData.value.length} 字符）：\n${truncateText(existingData.value)}\n\n新值（${value.length} 字符）：\n${truncateText(value)}`;
+        if (cookieAttrLines.length) {
+          body += `\n\n属性变更：\n- ${cookieAttrLines.join('\n- ')}`;
+        }
         if (existingData.sameNameConflict) {
           body += `\n\n注意：存在 ${existingData.sameNameCount} 条同名 cookie（不同 Path/Domain），写入将按「同名全部替换」策略清理后写入当前属性。`;
         }
@@ -3388,10 +3508,26 @@ async function handleRowSave(rowId) {
           return;
         }
       } else if (existingData.value === null) {
+        let body = `将写入新值（${value.length} 字符）：\n${truncateText(value)}`;
+        if (cookieOptionsPreview) {
+          body += `\n\n属性：HttpOnly=${cookieOptionsPreview.httpOnly ? '是' : '否'}，Secure=${cookieOptionsPreview.secure ? '是' : '否'}，Path=${cookieOptionsPreview.path || '/'}`;
+        }
         const confirmed = await showConfirmDialog({
           title: `确认新建写入「${key}」？`,
-          body: `将写入新值（${value.length} 字符）：\n${truncateText(value)}`,
+          body,
           okText: '确认写入',
+        });
+        if (!confirmed) {
+          setStatus('已取消保存', 'empty');
+          return;
+        }
+      } else if (cookieAttrLines.length) {
+        // 值未变，仅改 Cookie 属性（如勾选/取消 HttpOnly）
+        const confirmed = await showConfirmDialog({
+          title: `确认更新「${key}」的 Cookie 属性？`,
+          body: `值未变化，将更新属性：\n- ${cookieAttrLines.join('\n- ')}\n\n提示：徽章只反映已写入的结果，改勾选后需点「保存」才会生效。`,
+          okText: '确认更新属性',
+          danger: true,
         });
         if (!confirmed) {
           setStatus('已取消保存', 'empty');
@@ -3438,11 +3574,26 @@ async function handleRowSave(rowId) {
     await pushKeyHistory(key);
 
     if (!pageData.success) {
-      const failTip =
+      let failTip =
         currentStorageType === STORAGE_TYPES.cookie
           ? '写入后回读不一致（可能被浏览器拒绝：Secure/SameSite/Domain/大小限制等）'
           : '写入后回读不一致，请确认页面是否允许写入';
+      if (pageData.error) {
+        failTip = pageData.error;
+      }
+      if (pageData.attributeMismatch) {
+        failTip = `${pageData.error || 'Cookie 属性未按预期生效'}。请确认已选中对应行后再保存；若页面脚本会重写该 cookie，刷新后可能被覆盖。`;
+      }
+      if (pageData.prefixTip) {
+        failTip += `（${pageData.prefixTip}）`;
+      }
       setStatus(failTip, 'error');
+      await refreshAndRenderTable({
+        preferActiveKey:
+          currentStorageType === STORAGE_TYPES.cookie && pageData.cookie
+            ? buildCookieCacheKey(pageData.cookie)
+            : key,
+      });
       return;
     }
 
@@ -3487,7 +3638,12 @@ async function handleRowSave(rowId) {
       'success'
     );
 
-    await refreshAndRenderTable({ preferActiveKey: key });
+    await refreshAndRenderTable({
+      preferActiveKey:
+        currentStorageType === STORAGE_TYPES.cookie && pageData.cookie
+          ? buildCookieCacheKey(pageData.cookie)
+          : key,
+    });
   } catch (error) {
     setStatus(error instanceof Error ? error.message : '写入失败', 'error');
   } finally {
@@ -4143,6 +4299,39 @@ async function initPopup() {
   cookieSameSiteSelect.addEventListener('change', () => {
     if (cookieSameSiteSelect.value === 'None') {
       cookieSecureCheckbox.checked = true;
+    }
+    if (currentStorageType === STORAGE_TYPES.cookie) {
+      setStatus('Cookie 属性已修改，请点击对应行的「保存」写入', 'empty');
+    }
+  });
+  cookieSecureCheckbox.addEventListener('change', () => {
+    if (currentStorageType === STORAGE_TYPES.cookie) {
+      setStatus('Cookie 属性已修改，请点击对应行的「保存」写入', 'empty');
+    }
+  });
+  cookieHttpOnlyCheckbox.addEventListener('change', () => {
+    if (currentStorageType === STORAGE_TYPES.cookie) {
+      setStatus(
+        cookieHttpOnlyCheckbox.checked
+          ? '已勾选 HttpOnly，请点击对应行的「保存」写入（徽章保存后才会变）'
+          : '已取消 HttpOnly，请点击对应行的「保存」写入（徽章保存后才会变）',
+        'empty'
+      );
+    }
+  });
+  cookiePathInput.addEventListener('change', () => {
+    if (currentStorageType === STORAGE_TYPES.cookie) {
+      setStatus('Cookie 属性已修改，请点击对应行的「保存」写入', 'empty');
+    }
+  });
+  cookieDomainInput.addEventListener('change', () => {
+    if (currentStorageType === STORAGE_TYPES.cookie) {
+      setStatus('Cookie 属性已修改，请点击对应行的「保存」写入', 'empty');
+    }
+  });
+  cookieMaxAgeInput.addEventListener('change', () => {
+    if (currentStorageType === STORAGE_TYPES.cookie) {
+      setStatus('Cookie 属性已修改，请点击对应行的「保存」写入', 'empty');
     }
   });
 

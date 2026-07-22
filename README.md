@@ -2,7 +2,7 @@
 
 Chrome Manifest V3 浏览器扩展，用于管理当前页面的 **localStorage**、**sessionStorage** 与 **Cookie**（含 HttpOnly）。
 
-当前版本：`2.0.3`
+当前版本：`2.0.4`
 
 ## 界面预览
 
@@ -71,6 +71,8 @@ Chrome Manifest V3 浏览器扩展，用于管理当前页面的 **localStorage*
 
 - 系统页（如 `chrome://`）、扩展页、应用商店页不支持读写
 - Cookie 同名多 Path 时，先选中对应行（确认 Path / Domain 徽章）再删或改，以确保精确匹配
+- Cookie 属性栏（HttpOnly / Secure 等）改完后需点该行「保存」才会写入；行上徽章表示当前已生效属性
+- `__Host-` / `__Secure-` 前缀 cookie 会强制 Secure（`__Host-` 还会强制 Path=/ 且无 Domain）
 - 写入空字符串会被拒绝；删单条用「删除」，清空当前类型用工具栏「清空」
 - localStorage / sessionStorage 在表格内改 Key 后保存，会按「重命名」处理（删旧写新）
 - 行内「编辑」打开时自动格式化；「应用到行」与「保存」会对合法 JSON 自动压缩
