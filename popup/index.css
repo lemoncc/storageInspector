@@ -4,6 +4,11 @@
   padding: 0;
 }
 
+/* 避免 .btn { display: inline-flex } 等规则盖掉原生 hidden */
+[hidden] {
+  display: none !important;
+}
+
 :root {
   /* 与 JS applyPopupMaxHeight 对齐；未注入前作为回退 */
   --popup-max-height: 600px;
@@ -130,12 +135,25 @@ body {
   position: sticky;
   top: 0;
   z-index: 1;
-  padding: 6px 10px 4px;
-  background: #f8fafc;
-  color: #64748b;
+  margin: 0;
+  padding: 7px 10px 7px 12px;
+  border-bottom: 1px solid #dbe4f0;
+  border-left: 3px solid #3b82f6;
+  background: #eef2f7;
+  color: #334155;
   font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
   line-height: 1.2;
-  border-bottom: 1px solid #f1f5f9;
+}
+
+.keys-filter-group-label + .keys-filter-option {
+  margin-top: 2px;
+}
+
+.keys-filter-option + .keys-filter-group-label {
+  margin-top: 4px;
+  border-top: 1px solid #e2e8f0;
 }
 
 .keys-filter-option {
@@ -563,39 +581,88 @@ select.cookie-control {
   flex: 1;
   min-width: 0;
   max-height: 52px;
+  margin: 0;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
   font-size: 12px;
-  line-height: 30px;
-  color: #64748b;
+  font-weight: 500;
+  line-height: 28px;
+  color: #475569;
+  background: transparent;
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.status:not(:empty) {
+  background: #f1f5f9;
+  border-color: #e2e8f0;
+}
+
+.status.is-pending:not(:empty) {
+  color: #1e40af;
+  background: #eff6ff;
+  border-color: #bfdbfe;
 }
 
 .status.is-success {
-  color: #059669;
+  color: #047857;
+  background: #ecfdf5;
+  border-color: #6ee7b7;
 }
 
 .status.is-error {
-  color: #dc2626;
+  color: #b91c1c;
+  background: #fef2f2;
+  border-color: #fca5a5;
   line-height: 1.4;
-  padding-top: 4px;
-  padding-bottom: 4px;
+  padding-top: 6px;
+  padding-bottom: 6px;
 }
 
 .status.is-empty {
-  color: #94a3b8;
+  color: #64748b;
+  background: #f8fafc;
+  border-color: #cbd5e1;
 }
 
 .status.is-flash {
-  animation: status-flash 0.45s ease;
+  animation: status-flash 0.55s ease;
 }
 
 @keyframes status-flash {
   0% {
-    opacity: 0.35;
+    transform: translateY(1px);
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
+  }
+  35% {
+    transform: translateY(0);
+    box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.28);
   }
   100% {
-    opacity: 1;
+    transform: translateY(0);
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
+  }
+}
+
+.status.is-error.is-flash {
+  animation-name: status-flash-error;
+}
+
+@keyframes status-flash-error {
+  0% {
+    transform: translateY(1px);
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+  }
+  35% {
+    transform: translateY(0);
+    box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.28);
+  }
+  100% {
+    transform: translateY(0);
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
   }
 }
 
@@ -671,26 +738,34 @@ select.cookie-control {
   color: #b91c1c;
 }
 
-/* 全局 * { margin:0 } 会冲掉 dialog 默认 margin:auto，需显式居中 */
+/* dialog 铺满作遮罩点击层；白卡片在内部 form 上 */
 .confirm-dialog,
 .json-dialog {
   position: fixed;
   inset: 0;
-  margin: auto;
-  width: min(520px, calc(100% - 32px));
-  max-height: min(420px, calc(100% - 32px));
-  height: fit-content;
-  padding: 0;
-  border: 1px solid #cbd5e1;
-  border-radius: 10px;
-  background: #ffffff;
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  max-height: none;
+  margin: 0;
+  padding: 16px;
+  border: none;
+  background: transparent;
   color: #0f172a;
-  box-shadow: 0 16px 40px rgba(15, 23, 42, 0.2);
+  box-shadow: none;
+  overflow: auto;
 }
 
-.json-dialog {
-  width: min(640px, calc(100% - 24px));
-  max-height: min(520px, calc(100% - 24px));
+/* 未打开必须隐藏：作者样式的 display 会覆盖 UA 的 dialog:not([open]) */
+.confirm-dialog:not([open]),
+.json-dialog:not([open]) {
+  display: none;
+}
+
+.confirm-dialog[open],
+.json-dialog[open] {
+  display: grid;
+  place-items: center;
 }
 
 .confirm-dialog::backdrop,
@@ -698,11 +773,30 @@ select.cookie-control {
   background: rgba(15, 23, 42, 0.35);
 }
 
-.confirm-form {
+.confirm-form,
+.json-dialog-form {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  box-sizing: border-box;
+  width: min(520px, 100%);
+  height: fit-content;
+  max-height: min(420px, calc(100% - 8px));
+  margin: 0;
   padding: 16px;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  background: #ffffff;
+  box-shadow: 0 16px 40px rgba(15, 23, 42, 0.2);
+  overflow: hidden;
+}
+
+.json-dialog-form {
+  width: min(640px, 100%);
+  max-height: min(520px, calc(100% - 8px));
+  gap: 10px;
+  padding: 14px 16px;
+  min-height: 0;
 }
 
 .confirm-title {
@@ -731,6 +825,7 @@ select.cookie-control {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .confirm-dialog.is-danger #confirmOkBtn {
@@ -741,20 +836,12 @@ select.cookie-control {
   background: #b91c1c;
 }
 
-.json-dialog-form {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 14px 16px;
-  max-height: inherit;
-  min-height: 0;
-}
-
 .json-dialog-head {
   display: flex;
   flex-direction: column;
   gap: 4px;
   min-width: 0;
+  flex-shrink: 0;
 }
 
 .json-dialog-title {
@@ -775,9 +862,10 @@ select.cookie-control {
 .json-dialog-editor {
   display: block;
   width: 100%;
-  min-height: 260px;
+  height: 260px;
+  min-height: 180px;
   max-height: 340px;
-  flex: 1;
+  flex: 0 1 auto;
   padding: 10px;
   border: 1px solid #cbd5e1;
   border-radius: 6px;
@@ -806,6 +894,42 @@ select.cookie-control {
   font-size: 11px;
   color: #94a3b8;
   line-height: 1.4;
+  flex-shrink: 0;
+}
+
+.json-dialog-toast {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid #86efac;
+  border-radius: 6px;
+  background: #ecfdf5;
+  color: #047857;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+  flex-shrink: 0;
+}
+
+.json-dialog-toast.is-error {
+  border-color: #fca5a5;
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+.json-dialog-toast.is-empty {
+  border-color: #cbd5e1;
+  background: #f8fafc;
+  color: #475569;
+}
+
+.json-dialog-toast.is-pending {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+  color: #1e40af;
+}
+
+.json-dialog-toast.is-flash {
+  animation: status-flash 0.55s ease;
 }
 
 .json-dialog-actions {
@@ -814,6 +938,7 @@ select.cookie-control {
   align-items: center;
   justify-content: flex-end;
   gap: 6px;
+  flex-shrink: 0;
 }
 
 .json-dialog-actions .btn {

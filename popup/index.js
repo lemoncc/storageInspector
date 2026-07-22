@@ -60,6 +60,7 @@ const jsonDialogTitleEl = document.getElementById('jsonDialogTitle');
 const jsonDialogKeyEl = document.getElementById('jsonDialogKey');
 const jsonDialogEditor = document.getElementById('jsonDialogEditor');
 const jsonDialogMetaEl = document.getElementById('jsonDialogMeta');
+const jsonDialogToastEl = document.getElementById('jsonDialogToast');
 const jsonFormatBtn = document.getElementById('jsonFormatBtn');
 const jsonCompressBtn = document.getElementById('jsonCompressBtn');
 const jsonCopyBtn = document.getElementById('jsonCopyBtn');
@@ -117,6 +118,8 @@ let filterDropdownActiveIndex = -1;
 let filterDropdownFlatOptions = [];
 /** 失焦关闭下拉的延时句柄 */
 let filterDropdownBlurTimer = 0;
+/** JSON 弹窗内提示自动隐藏句柄 */
+let jsonDialogToastTimer = 0;
 
 /**
  * 递归格式化还原表：路径 -> { prefix, suffix, original }
@@ -2062,6 +2065,24 @@ function parseAllDialogPayload(rawText) {
 }
 
 /**
+ * JSON 编辑器滚到顶部并把光标置于开头（避免 focus 滚到文末）
+ */
+function resetJsonDialogEditorScrollTop() {
+  const reset = () => {
+    jsonDialogEditor.scrollTop = 0;
+    jsonDialogEditor.scrollLeft = 0;
+    try {
+      jsonDialogEditor.setSelectionRange(0, 0);
+    } catch {
+      // readonly / 不支持选区时忽略
+    }
+  };
+  reset();
+  // 部分浏览器 focus 后会异步滚到光标，下一帧再校正一次
+  requestAnimationFrame(reset);
+}
+
+/**
  * 打开单行 JSON 查看 / 编辑弹窗
  * @param {string} rowId
  * @param {'view' | 'edit'} mode
@@ -2095,6 +2116,7 @@ function openJsonDialog(rowId, mode) {
   if (mode === 'edit') {
     jsonDialogEditor.focus();
   }
+  resetJsonDialogEditorScrollTop();
 }
 
 /**
@@ -2133,6 +2155,7 @@ function openAllJsonDialog(mode) {
   if (mode === 'edit') {
     jsonDialogEditor.focus();
   }
+  resetJsonDialogEditorScrollTop();
 }
 
 /**
@@ -3143,7 +3166,7 @@ function applyPopupMaxHeight() {
 
 
 /**
- * 设置状态文案到 #statusText
+ * 设置状态文案到 #statusText；JSON 弹窗打开时同步在弹窗内提示
  * @param {string} text
  * @param {'success' | 'error' | 'empty' | 'pending' | ''} [type]
  */
@@ -3153,6 +3176,7 @@ function setStatus(text, type = '') {
   statusTextEl.className = `status${nextType ? ` is-${nextType}` : ''}`;
 
   if (!text) {
+    clearJsonDialogToast();
     return;
   }
 
@@ -3161,6 +3185,46 @@ function setStatus(text, type = '') {
     void statusTextEl.offsetWidth;
     statusTextEl.classList.add('is-flash');
   }
+
+  // 弹窗打开时底部提示被挡住，改在弹窗内同步展示
+  if (jsonDialog.open) {
+    showJsonDialogToast(text, nextType);
+  }
+}
+
+/**
+ * 在 JSON 弹窗内显示操作提示
+ * @param {string} text
+ * @param {string} [type]
+ */
+function showJsonDialogToast(text, type = 'success') {
+  if (!(jsonDialogToastEl instanceof HTMLElement)) {
+    return;
+  }
+  window.clearTimeout(jsonDialogToastTimer);
+  jsonDialogToastEl.hidden = false;
+  jsonDialogToastEl.textContent = text;
+  jsonDialogToastEl.className = `json-dialog-toast is-${type || 'pending'}`;
+  jsonDialogToastEl.classList.remove('is-flash');
+  void jsonDialogToastEl.offsetWidth;
+  jsonDialogToastEl.classList.add('is-flash');
+  jsonDialogToastTimer = window.setTimeout(() => {
+    clearJsonDialogToast();
+  }, 2200);
+}
+
+/**
+ * 清除 JSON 弹窗内提示
+ */
+function clearJsonDialogToast() {
+  window.clearTimeout(jsonDialogToastTimer);
+  jsonDialogToastTimer = 0;
+  if (!(jsonDialogToastEl instanceof HTMLElement)) {
+    return;
+  }
+  jsonDialogToastEl.hidden = true;
+  jsonDialogToastEl.textContent = '';
+  jsonDialogToastEl.className = 'json-dialog-toast';
 }
 
 /**
@@ -5534,6 +5598,18 @@ async function initPopup() {
     jsonDialogScope = 'row';
     // 关闭弹窗时清掉格式化态，避免污染后续行内保存
     clearFormatStateForUi();
+    clearJsonDialogToast();
+  });
+  // 点击遮罩（dialog 空白区）关闭
+  jsonDialog.addEventListener('click', (event) => {
+    if (event.target === jsonDialog) {
+      closeJsonDialog();
+    }
+  });
+  confirmDialog.addEventListener('click', (event) => {
+    if (event.target === confirmDialog) {
+      confirmDialog.close('cancel');
+    }
   });
   jsonDialogEditor.addEventListener('input', () => {
     if (jsonDialogMode !== 'edit') {
