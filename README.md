@@ -2,7 +2,7 @@
 
 Chrome Manifest V3 浏览器扩展，用于管理当前页面的 **localStorage**、**sessionStorage** 与 **Cookie**（含 HttpOnly）。
 
-当前版本：`2.1.3`
+当前版本：`2.1.5`
 
 ## 界面预览
 

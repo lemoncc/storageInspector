@@ -120,6 +120,8 @@ let filterDropdownFlatOptions = [];
 let filterDropdownBlurTimer = 0;
 /** JSON 弹窗内提示自动隐藏句柄 */
 let jsonDialogToastTimer = 0;
+/** 打开 JSON 弹窗时的编辑器基线，用于判断点遮罩是否丢弃未保存修改 */
+let jsonDialogBaselineText = '';
 
 /**
  * 递归格式化还原表：路径 -> { prefix, suffix, original }
@@ -1764,6 +1766,13 @@ let rowSwitchLock = Promise.resolve();
 
 function showConfirmDialog(options) {
   const { title, body, okText = '确认', danger = false } = options;
+
+  // 已有确认框：不改文案、不叠加 depth，直接拒绝，避免污染当前对话框
+  if (confirmDialog.open) {
+    setStatus('请先处理当前确认对话框', 'empty');
+    return Promise.resolve(false);
+  }
+
   confirmTitleEl.textContent = title;
   confirmBodyEl.textContent = body;
   confirmOkBtn.textContent = okText;
@@ -1782,12 +1791,6 @@ function showConfirmDialog(options) {
       }
       resolve(confirmed);
     };
-
-    if (confirmDialog.open) {
-      // 已有确认框：直接拒绝本次，避免 listener 泄漏与 busy 粘死
-      finish(false);
-      return;
-    }
 
     const onClose = () => {
       confirmDialog.removeEventListener('close', onClose);
@@ -2107,6 +2110,7 @@ function openJsonDialog(rowId, mode) {
     ? `Key：${row.key.trim()}`
     : 'Key：（未填写）';
   jsonDialogEditor.value = pretty.text;
+  jsonDialogBaselineText = pretty.text;
   syncJsonDialogControls();
   updateJsonDialogMeta(pretty.text, pretty.isJson);
 
@@ -2144,8 +2148,10 @@ function openAllJsonDialog(mode) {
   jsonDialogRowId = null;
   jsonDialogMode = mode;
   clearFormatStateForUi();
+  clearJsonDialogToast();
   jsonDialogKeyEl.textContent = subtitle;
   jsonDialogEditor.value = pretty.text;
+  jsonDialogBaselineText = pretty.text;
   syncJsonDialogControls();
   updateJsonDialogMeta(pretty.text, pretty.isJson);
 
@@ -2156,6 +2162,27 @@ function openAllJsonDialog(mode) {
     jsonDialogEditor.focus();
   }
   resetJsonDialogEditorScrollTop();
+}
+
+/**
+ * 点击遮罩关闭 JSON 弹窗（编辑态有改动时先确认）
+ */
+async function handleJsonDialogBackdropClose() {
+  if (
+    jsonDialogMode === 'edit' &&
+    jsonDialogEditor.value !== jsonDialogBaselineText
+  ) {
+    const confirmed = await showConfirmDialog({
+      title: '关闭编辑？',
+      body: '弹窗内有未保存的修改，关闭将丢弃这些更改（不会写入页面存储）。',
+      okText: '丢弃并关闭',
+      danger: true,
+    });
+    if (!confirmed) {
+      return;
+    }
+  }
+  closeJsonDialog();
 }
 
 /**
@@ -2447,90 +2474,90 @@ async function handleJsonDialogApplyAll() {
     return;
   }
 
-  /** @type {{ mode: 'entries', entries: Record<string, string> } | { mode: 'cookieDetails', cookies: NonNullable<ReturnType<typeof normalizeImportedCookieItem>>[] }} */
-  let payload;
-  try {
-    // 写入前若处于展开态，先按还原逻辑压缩
-    const prepared = prepareValueForWrite(jsonDialogEditor.value);
-    payload = parseAllDialogPayload(prepared.text);
-  } catch (error) {
-    setStatus(error instanceof Error ? error.message : 'JSON 解析失败', 'error');
-    return;
-  }
-
-  /** @type {string} */
-  let preview;
-  /** @type {number} */
-  let totalCount;
-  /** @type {string} */
-  let cookieTip = '';
-  /** @type {string[]} */
-  let skippedEmpty;
-
-  if (payload.mode === 'cookieDetails') {
-    const stripped = omitEmptyCookieValues(payload.cookies);
-    payload = { mode: 'cookieDetails', cookies: stripped.cookies };
-    skippedEmpty = stripped.skipped;
-    totalCount = payload.cookies.length;
-    if (!totalCount) {
-      setStatus(
-        skippedEmpty.length
-          ? `${formatEmptyValueKeysTip(skippedEmpty)}；且没有其它可写入条目。清空存储请用工具栏「清空」`
-          : '没有可写入的 cookie。全部 JSON 不会删除未出现的项；清空请用工具栏「清空」',
-        'empty'
-      );
-      return;
-    }
-    preview = payload.cookies
-      .slice(0, 8)
-      .map(
-        (item) =>
-          `- ${item.name}（path=${item.path}${item.domain ? `, domain=${item.domain}` : ''}，${item.value.length} 字符）`
-      )
-      .join('\n');
-    cookieTip = '\n\n将按每条自身的 Path/Domain/分区精确写入（同名多 Path 互不影响）。';
-  } else {
-    const stripped = omitEmptyEntryValues(payload.entries);
-    payload = { mode: 'entries', entries: stripped.entries };
-    skippedEmpty = stripped.skipped;
-    totalCount = Object.keys(payload.entries).length;
-    if (!totalCount) {
-      setStatus(
-        skippedEmpty.length
-          ? `${formatEmptyValueKeysTip(skippedEmpty)}；且没有其它可写入条目。清空存储请用工具栏「清空」`
-          : '没有可写入的 key。全部 JSON 不会删除未出现的项；清空请用工具栏「清空」',
-        'empty'
-      );
-      return;
-    }
-    preview = Object.keys(payload.entries)
-      .slice(0, 8)
-      .map((key) => `- ${key}（${payload.entries[key].length} 字符）`)
-      .join('\n');
-    if (currentStorageType === STORAGE_TYPES.cookie) {
-      cookieTip =
-        '\n\n兼容模式：{ name: value } 将使用上方属性栏 Path/Domain 批量写入（只能表达一条 identity）。建议改用 cookies[] 数组。';
-    }
-  }
-
-  const moreTip = totalCount > 8 ? `\n…共 ${totalCount} 条` : '';
-  const skipTip = skippedEmpty.length
-    ? `\n\n将跳过 ${skippedEmpty.length} 个空值（清空请用删除）。`
-    : '';
-  const confirmed = await showConfirmDialog({
-    title: `确认写入全部到 ${getStorageTypeLabel(currentStorageType)}？`,
-    body: `将写入 / 覆盖以下条目（不会删除未出现在 JSON 中的项）：\n${preview}${moreTip}${skipTip}${cookieTip}`,
-    okText: '确认写入',
-    danger: true,
-  });
-  if (!confirmed) {
-    setStatus('已取消写入全部', 'empty');
-    return;
-  }
-
   setBusy(true);
-  setStatus('批量写入中...');
   try {
+    /** @type {{ mode: 'entries', entries: Record<string, string> } | { mode: 'cookieDetails', cookies: NonNullable<ReturnType<typeof normalizeImportedCookieItem>>[] }} */
+    let payload;
+    try {
+      // 写入前若处于展开态，先按还原逻辑压缩
+      const prepared = prepareValueForWrite(jsonDialogEditor.value);
+      payload = parseAllDialogPayload(prepared.text);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'JSON 解析失败', 'error');
+      return;
+    }
+
+    /** @type {string} */
+    let preview;
+    /** @type {number} */
+    let totalCount;
+    /** @type {string} */
+    let cookieTip = '';
+    /** @type {string[]} */
+    let skippedEmpty;
+
+    if (payload.mode === 'cookieDetails') {
+      const stripped = omitEmptyCookieValues(payload.cookies);
+      payload = { mode: 'cookieDetails', cookies: stripped.cookies };
+      skippedEmpty = stripped.skipped;
+      totalCount = payload.cookies.length;
+      if (!totalCount) {
+        setStatus(
+          skippedEmpty.length
+            ? `${formatEmptyValueKeysTip(skippedEmpty)}；且没有其它可写入条目。清空存储请用工具栏「清空」`
+            : '没有可写入的 cookie。全部 JSON 不会删除未出现的项；清空请用工具栏「清空」',
+          'empty'
+        );
+        return;
+      }
+      preview = payload.cookies
+        .slice(0, 8)
+        .map(
+          (item) =>
+            `- ${item.name}（path=${item.path}${item.domain ? `, domain=${item.domain}` : ''}，${item.value.length} 字符）`
+        )
+        .join('\n');
+      cookieTip = '\n\n将按每条自身的 Path/Domain/分区精确写入（同名多 Path 互不影响）。';
+    } else {
+      const stripped = omitEmptyEntryValues(payload.entries);
+      payload = { mode: 'entries', entries: stripped.entries };
+      skippedEmpty = stripped.skipped;
+      totalCount = Object.keys(payload.entries).length;
+      if (!totalCount) {
+        setStatus(
+          skippedEmpty.length
+            ? `${formatEmptyValueKeysTip(skippedEmpty)}；且没有其它可写入条目。清空存储请用工具栏「清空」`
+            : '没有可写入的 key。全部 JSON 不会删除未出现的项；清空请用工具栏「清空」',
+          'empty'
+        );
+        return;
+      }
+      preview = Object.keys(payload.entries)
+        .slice(0, 8)
+        .map((key) => `- ${key}（${payload.entries[key].length} 字符）`)
+        .join('\n');
+      if (currentStorageType === STORAGE_TYPES.cookie) {
+        cookieTip =
+          '\n\n兼容模式：{ name: value } 将使用上方属性栏 Path/Domain 批量写入（只能表达一条 identity）。建议改用 cookies[] 数组。';
+      }
+    }
+
+    const moreTip = totalCount > 8 ? `\n…共 ${totalCount} 条` : '';
+    const skipTip = skippedEmpty.length
+      ? `\n\n将跳过 ${skippedEmpty.length} 个空值（清空请用删除）。`
+      : '';
+    const confirmed = await showConfirmDialog({
+      title: `确认写入全部到 ${getStorageTypeLabel(currentStorageType)}？`,
+      body: `将写入 / 覆盖以下条目（不会删除未出现在 JSON 中的项）：\n${preview}${moreTip}${skipTip}${cookieTip}`,
+      okText: '确认写入',
+      danger: true,
+    });
+    if (!confirmed) {
+      setStatus('已取消写入全部', 'empty');
+      return;
+    }
+
+    setStatus('批量写入中...');
     const tab = await getActiveTab();
     assertInjectableTab(tab);
 
@@ -2588,12 +2615,32 @@ async function handleJsonDialogSave() {
     return;
   }
 
-  // 先压缩写回表格行并关闭弹窗，再走行内保存（含确认）
-  const appliedRowId = applyJsonDialogToRow({ closeDialog: true, silentStatus: true });
+  const targetRowId = jsonDialogRowId;
+  const targetRow = tableRows.find((item) => item.rowId === targetRowId) || null;
+  const previousValue = targetRow ? targetRow.value : '';
+  const previousDomValue = getRowValueTextarea(targetRowId)?.value ?? previousValue;
+
+  // 先写回行内但不关窗，确认取消时可还原；成功后再关窗
+  const appliedRowId = applyJsonDialogToRow({ closeDialog: false, silentStatus: true });
   if (!appliedRowId) {
     return;
   }
-  await handleRowSave(appliedRowId);
+  const saved = await handleRowSave(appliedRowId);
+  if (!saved) {
+    const tip = statusTextEl.textContent || '';
+    if (tip === '已取消保存') {
+      if (targetRow) {
+        targetRow.value = previousValue;
+      }
+      const textarea = getRowValueTextarea(appliedRowId);
+      if (textarea) {
+        textarea.value = previousDomValue;
+      }
+      syncRowModelFromDom(appliedRowId);
+    }
+    return;
+  }
+  closeJsonDialog();
 }
 
 /**
@@ -3208,9 +3255,13 @@ function showJsonDialogToast(text, type = 'success') {
   jsonDialogToastEl.classList.remove('is-flash');
   void jsonDialogToastEl.offsetWidth;
   jsonDialogToastEl.classList.add('is-flash');
-  jsonDialogToastTimer = window.setTimeout(() => {
-    clearJsonDialogToast();
-  }, 2200);
+  // 错误提示保留更久，避免被挡住后一闪而过
+  const hideMs = type === 'error' ? 6000 : type === 'pending' ? 0 : 2200;
+  if (hideMs > 0) {
+    jsonDialogToastTimer = window.setTimeout(() => {
+      clearJsonDialogToast();
+    }, hideMs);
+  }
 }
 
 /**
@@ -3531,10 +3582,8 @@ function openFilterDropdown() {
   if (keysFilterInput instanceof HTMLInputElement) {
     keysFilterInput.setAttribute('aria-expanded', 'true');
   }
-  if (filterDropdownActiveIndex < 0 && filterDropdownFlatOptions.length) {
-    filterDropdownActiveIndex = 0;
-    syncFilterDropdownActiveOption();
-  }
+  // 不默认高亮首项，避免 Enter 误选建议
+  syncFilterDropdownActiveOption();
 }
 
 /**
@@ -3582,16 +3631,12 @@ async function applyKeysFilterKeyword(keyword, options = {}) {
   if (activeRowId && !visibleRows.some((row) => row.rowId === activeRowId)) {
     const nextId = visibleRows[0]?.rowId || null;
     const previousActiveId = activeRowId;
-    const switched = await setActiveRow(nextId, { syncCookie: true });
+    // 筛选切行跳过属性确认，避免打字时弹窗；取消时也保留当前筛选关键字
+    const switched = await setActiveRow(nextId, { syncCookie: true, skipAttrConfirm: true });
     if (seq !== filterInputSeq) {
       return;
     }
     if (!switched) {
-      keysFilterInput.value = '';
-      filterKeyword = '';
-      filterInputSeq += 1;
-      syncFilterClearButton();
-      renderStorageTable();
       void setActiveRow(previousActiveId, { syncCookie: false, skipAttrConfirm: true });
       return;
     }
@@ -4137,8 +4182,10 @@ async function refreshAndRenderTable(options = {}) {
   preservedDrafts.forEach((row) => syncRowModelFromDom(row.rowId));
 
   const previousActive = tableRows.find((row) => row.rowId === activeRowId) || null;
+  // Cookie 优先用 cacheKey，避免同名多 Path 刷新后选中错行
   const preferKey =
     preferActiveKey ||
+    previousActive?.cacheKey ||
     previousActive?.key ||
     previousActive?.originKey ||
     null;
@@ -4308,20 +4355,30 @@ async function readExistingForSave(tab, key, row) {
         isCookieSameIdentity(cookie, nextPath, nextDomainNorm, nextPartitionSig)
     );
     if (sameIdentity) {
-      return { value: sameIdentity.value, httpOnly: Boolean(sameIdentity.httpOnly), cookie: sameIdentity };
+      const sameNameOthers = all.filter(
+        (cookie) =>
+          cookie.name === key && buildCookieCacheKey(cookie) !== buildCookieCacheKey(sameIdentity)
+      );
+      return {
+        value: sameIdentity.value,
+        httpOnly: Boolean(sameIdentity.httpOnly),
+        cookie: sameIdentity,
+        sameNameCount: sameNameOthers.length,
+        sameNameConflict: false,
+      };
     }
-    // 草稿/改名新建：提示同名其他 Path/分区仍在
+    // 草稿/改名新建：提示同名其他 Path/分区仍在（不拿其它 Path 的值/属性做对比）
     const sameName = all.filter((cookie) => cookie.name === key);
     if (sameName.length) {
       return {
-        value: sameName[0].value,
-        httpOnly: Boolean(sameName[0].httpOnly),
-        cookie: sameName[0],
+        value: null,
+        httpOnly: false,
+        cookie: null,
         sameNameConflict: true,
         sameNameCount: sameName.length,
       };
     }
-    return { value: null, httpOnly: false, cookie: null };
+    return { value: null, httpOnly: false, cookie: null, sameNameCount: 0 };
   }
   return readStorageValue(tab, currentStorageType, key);
 }
@@ -4329,34 +4386,35 @@ async function readExistingForSave(tab, key, row) {
 /**
  * 行内保存
  * @param {string} rowId
+ * @returns {Promise<boolean>} 是否写入成功
  */
 async function handleRowSave(rowId) {
   if (isBusy) {
-    return;
+    return false;
   }
 
   syncRowModelFromDom(rowId);
   const row = tableRows.find((item) => item.rowId === rowId);
   if (!row) {
-    return;
+    return false;
   }
 
   const key = row.key.trim();
   if (!key) {
     setStatus('请输入 key', 'error');
     getRowKeyInput(rowId)?.focus();
-    return;
+    return false;
   }
 
   const textarea = getRowValueTextarea(rowId);
   if (!textarea) {
-    return;
+    return false;
   }
 
   if (!textarea.value) {
     setStatus('请先粘贴或输入要写入的值（空字符串拒绝写入）', 'error');
     textarea.focus();
-    return;
+    return false;
   }
 
   ensureFormatBoundToRow(rowId);
@@ -4402,7 +4460,9 @@ async function handleRowSave(rowId) {
       cookieIdentityChanged =
         oldCookieDetail.name !== key ||
         oldPath !== nextPath ||
-        oldDomainNorm !== nextDomainNorm;
+        oldDomainNorm !== nextDomainNorm ||
+        serializePartitionKeyPart(oldCookieDetail.partitionKey) !==
+          serializePartitionKeyPart(cookieOptionsPreview.partitionKey);
     }
 
     /** @type {'replace-all-same-name' | 'upsert-identity'} */
@@ -4427,7 +4487,7 @@ async function handleRowSave(rowId) {
       });
       if (!confirmed) {
         setStatus('已取消保存', 'empty');
-        return;
+        return false;
       }
     } else {
       const existingData = await readExistingForSave(tab, key, row);
@@ -4501,6 +4561,14 @@ async function handleRowSave(rowId) {
         if (cookieAttrLines.length) {
           body += `\n\n属性变更：\n- ${cookieAttrLines.join('\n- ')}`;
         }
+        if (existingData.cookie && existingData.value !== null) {
+          body += `\n\n目标 identity 已存在，将被覆盖（${existingData.value.length} 字符）：\n${truncateText(existingData.value)}`;
+        }
+        if (existingData.sameNameConflict) {
+          body += `\n\n注意：另有 ${existingData.sameNameCount} 条同名 cookie（不同 Path/Domain/分区）会保留，不会一并删除。`;
+        } else if (existingData.sameNameCount > 0) {
+          body += `\n\n注意：另有 ${existingData.sameNameCount} 条同名 cookie（不同 Path/Domain/分区）会保留。`;
+        }
         const confirmed = await showConfirmDialog({
           title: `确认迁移 Cookie「${oldCookieDetail.name}」？`,
           body,
@@ -4509,45 +4577,45 @@ async function handleRowSave(rowId) {
         });
         if (!confirmed) {
           setStatus('已取消保存', 'empty');
-          return;
+          return false;
         }
+      } else if (existingData.sameNameConflict) {
+        // 同名不同 Path：无论值是否碰巧相同，都要明确确认
+        let body = `将写入「${key}」（path=${cookieOptionsPreview?.path || '/'}）。\n\n新值（${value.length} 字符）：\n${truncateText(value)}`;
+        body += `\n\n注意：已存在 ${existingData.sameNameCount} 条同名 cookie（不同 Path/Domain/分区）。\n默认只新增/更新当前 identity，不会删除其它同名条目。`;
+        if (cookieOptionsPreview) {
+          body += `\n\n属性：HttpOnly=${cookieOptionsPreview.httpOnly ? '是' : '否'}，Secure=${cookieOptionsPreview.secure ? '是' : '否'}，Path=${cookieOptionsPreview.path || '/'}`;
+        }
+        const confirmedExact = await showConfirmDialog({
+          title: `确认写入「${key}」？`,
+          body: `${body}\n\n若需删除全部同名后再写入，请先用各自行的「删除」清掉其它 Path。`,
+          okText: '仅更新当前',
+          danger: true,
+        });
+        if (!confirmedExact) {
+          setStatus('已取消保存', 'empty');
+          return false;
+        }
+        cookieConflictMode = 'upsert-identity';
       } else if (existingData.value !== null && existingData.value !== value) {
         let body = `旧值（${existingData.value.length} 字符）：\n${truncateText(existingData.value)}\n\n新值（${value.length} 字符）：\n${truncateText(value)}`;
         if (cookieAttrLines.length) {
           body += `\n\n属性变更：\n- ${cookieAttrLines.join('\n- ')}`;
         }
-        if (existingData.sameNameConflict) {
-          body += `\n\n注意：另有 ${existingData.sameNameCount} 条同名 cookie（不同 Path/Domain）。\n默认只更新当前 Path/Domain，其它同名条目会保留。`;
-          const confirmedExact = await showConfirmDialog({
-            title: `确认写入「${key}」？`,
-            body: `${body}\n\n若需删除全部同名后再写入，请先用各自行的「删除」清掉其它 Path。`,
-            okText: '仅更新当前',
-            danger: true,
-          });
-          if (!confirmedExact) {
-            setStatus('已取消保存', 'empty');
-            return;
-          }
-          cookieConflictMode = 'upsert-identity';
-        } else {
-          const confirmed = await showConfirmDialog({
-            title: `确认覆盖写入「${key}」？`,
-            body,
-            okText: '确认覆盖',
-            danger: true,
-          });
-          if (!confirmed) {
-            setStatus('已取消保存', 'empty');
-            return;
-          }
+        const confirmed = await showConfirmDialog({
+          title: `确认覆盖写入「${key}」？`,
+          body,
+          okText: '确认覆盖',
+          danger: true,
+        });
+        if (!confirmed) {
+          setStatus('已取消保存', 'empty');
+          return false;
         }
       } else if (existingData.value === null) {
         let body = `将写入新值（${value.length} 字符）：\n${truncateText(value)}`;
         if (cookieOptionsPreview) {
           body += `\n\n属性：HttpOnly=${cookieOptionsPreview.httpOnly ? '是' : '否'}，Secure=${cookieOptionsPreview.secure ? '是' : '否'}，Path=${cookieOptionsPreview.path || '/'}`;
-        }
-        if (existingData.sameNameConflict) {
-          body += `\n\n注意：已存在 ${existingData.sameNameCount} 条同名 cookie（不同 Path/Domain）。默认只新增/更新当前 Path/Domain，不会删除其它同名条目。`;
         }
         const confirmed = await showConfirmDialog({
           title: `确认新建写入「${key}」？`,
@@ -4556,7 +4624,7 @@ async function handleRowSave(rowId) {
         });
         if (!confirmed) {
           setStatus('已取消保存', 'empty');
-          return;
+          return false;
         }
       } else if (cookieAttrLines.length) {
         // 值未变，仅改 Cookie 属性（如勾选/取消 HttpOnly）
@@ -4568,7 +4636,7 @@ async function handleRowSave(rowId) {
         });
         if (!confirmed) {
           setStatus('已取消保存', 'empty');
-          return;
+          return false;
         }
       }
     }
@@ -4614,6 +4682,22 @@ async function handleRowSave(rowId) {
       if (pageData.prefixTip) {
         failTip += `（${pageData.prefixTip}）`;
       }
+      // 新 identity 已落盘时仍删旧，避免 success=false 留下新旧双份
+      if (cookieIdentityChanged && oldCookieDetail && pageData.cookie) {
+        await chrome.cookies.remove({
+          url: buildCookieUrl(oldCookieDetail, tab),
+          name: oldCookieDetail.name,
+          storeId: oldCookieDetail.storeId,
+          ...buildPartitionKeyField(oldCookieDetail),
+        });
+        const oldCacheKey = buildCookieCacheKey(oldCookieDetail);
+        const stillExists = (await collectTabCookies(tab)).some(
+          (cookie) => buildCookieCacheKey(cookie) === oldCacheKey
+        );
+        failTip += stillExists
+          ? '；旧 identity 仍在，请手动删除以免双份。'
+          : '；已删除旧 identity，请核对新条目属性。';
+      }
       setStatus(failTip, 'error');
       await refreshAndRenderTable({
         preferActiveKey:
@@ -4621,7 +4705,7 @@ async function handleRowSave(rowId) {
             ? buildCookieCacheKey(pageData.cookie)
             : key,
       });
-      return;
+      return false;
     }
 
     if (isStorageRename && row.originKey) {
@@ -4632,7 +4716,7 @@ async function handleRowSave(rowId) {
           'error'
         );
         await refreshAndRenderTable({ preferActiveKey: key });
-        return;
+        return false;
       }
     }
 
@@ -4658,7 +4742,7 @@ async function handleRowSave(rowId) {
             ? buildCookieCacheKey(pageData.cookie)
             : key,
         });
-        return;
+        return false;
       }
     }
 
@@ -4714,8 +4798,10 @@ async function handleRowSave(rowId) {
           ? buildCookieCacheKey(pageData.cookie)
           : key,
     });
+    return true;
   } catch (error) {
     setStatus(error instanceof Error ? error.message : '写入失败', 'error');
+    return false;
   } finally {
     setBusy(false);
   }
@@ -4729,40 +4815,39 @@ async function handleRowDelete(rowId) {
   if (isBusy) {
     return;
   }
-
-  syncRowModelFromDom(rowId);
-  const row = tableRows.find((item) => item.rowId === rowId);
-  if (!row) {
-    return;
-  }
-
-  // 草稿未入库：直接移除
-  if (row.isDraft) {
-    tableRows = tableRows.filter((item) => item.rowId !== rowId);
-    if (formatBoundRowId === rowId) {
-      clearFormatStateForUi();
-    }
-    if (activeRowId === rowId) {
-      activeRowId = tableRows[0]?.rowId || null;
-    }
-    renderStorageTable();
-    if (activeRowId) {
-      void setActiveRow(activeRowId, { skipAttrConfirm: true });
-    }
-    setStatus('已移除草稿行', 'success');
-    return;
-  }
-
-  const key = (row.originKey || row.key || '').trim();
-  if (!key) {
-    setStatus('无法删除：缺少 key', 'error');
-    return;
-  }
-
-  const typeLabel = getStorageTypeLabel(currentStorageType);
+  setBusy(true);
 
   try {
-    setBusy(true);
+    syncRowModelFromDom(rowId);
+    const row = tableRows.find((item) => item.rowId === rowId);
+    if (!row) {
+      return;
+    }
+
+    // 草稿未入库：直接移除
+    if (row.isDraft) {
+      tableRows = tableRows.filter((item) => item.rowId !== rowId);
+      if (formatBoundRowId === rowId) {
+        clearFormatStateForUi();
+      }
+      if (activeRowId === rowId) {
+        activeRowId = tableRows[0]?.rowId || null;
+      }
+      renderStorageTable();
+      if (activeRowId) {
+        void setActiveRow(activeRowId, { skipAttrConfirm: true });
+      }
+      setStatus('已移除草稿行', 'success');
+      return;
+    }
+
+    const key = (row.originKey || row.key || '').trim();
+    if (!key) {
+      setStatus('无法删除：缺少 key', 'error');
+      return;
+    }
+
+    const typeLabel = getStorageTypeLabel(currentStorageType);
     const tab = await getActiveTab();
     assertInjectableTab(tab);
 
@@ -4800,7 +4885,6 @@ async function handleRowDelete(rowId) {
       body += `\n\n将按 Path=${cookieOptions.path}${cookieOptions.domain ? ` Domain=${cookieOptions.domain}` : '（host-only）'} 精确删除。`;
     }
 
-    setBusy(true);
     const confirmed = await showConfirmDialog({
       title: `确认删除 ${typeLabel} / ${key}？`,
       body,
@@ -4846,13 +4930,14 @@ async function handleExport() {
     return;
   }
 
+  setBusy(true);
   const canDiscard = await confirmDiscardDirtyEdits('导出');
   if (!canDiscard) {
     setStatus('已取消导出', 'empty');
+    setBusy(false);
     return;
   }
 
-  setBusy(true);
   setStatus('导出中...');
 
   try {
@@ -4907,20 +4992,48 @@ async function handleImportFile(file) {
     return;
   }
 
+  setBusy(true);
   const canDiscard = await confirmDiscardDirtyEdits('导入');
   if (!canDiscard) {
     setStatus('已取消导入', 'empty');
+    setBusy(false);
+    importFileInput.value = '';
     return;
   }
 
-  // 丢弃确认通过后立即持锁，覆盖后续解析与二次确认间隙
-  setBusy(true);
+  // 丢弃确认通过后保持持锁，覆盖后续解析与二次确认间隙
   setStatus('导入准备中...');
-  const importTargetType = currentStorageType;
+  let importTargetType = currentStorageType;
+  let switchedToCookieForImport = false;
 
   try {
     const text = await file.text();
     let payload = parseImportPayload(text);
+
+    // cookies[] 只能进 cookie：非 cookie tab 时询问是否切换
+    if (payload.mode === 'cookieDetails' && importTargetType !== STORAGE_TYPES.cookie) {
+      const switchToCookie = await showConfirmDialog({
+        title: '需要切换到 cookie',
+        body: '文件包含 cookies[] 详情，只能导入到 cookie 类型。是否切换到 cookie 并继续导入？',
+        okText: '切换并导入',
+        danger: false,
+      });
+      if (!switchToCookie) {
+        setStatus('已取消导入', 'empty');
+        return;
+      }
+      currentStorageType = STORAGE_TYPES.cookie;
+      importTargetType = STORAGE_TYPES.cookie;
+      switchedToCookieForImport = true;
+      renderActiveTab();
+      pageKeyCache = [];
+      pageEntriesCache = {};
+      cookieDetailCache = {};
+      tableRows = [];
+      activeRowId = null;
+      await chrome.storage.local.set({ [LAST_TYPE_STORAGE]: STORAGE_TYPES.cookie });
+      await restoreDefaultFilterKeyword();
+    }
 
     /** @type {string[]} */
     let skippedEmpty = [];
@@ -4957,6 +5070,9 @@ async function handleImportFile(file) {
       });
       if (!confirmedType) {
         setStatus('已取消导入', 'empty');
+        if (switchedToCookieForImport) {
+          await refreshAndRenderTable();
+        }
         return;
       }
     }
@@ -4993,6 +5109,9 @@ async function handleImportFile(file) {
     });
     if (!confirmed) {
       setStatus('已取消导入', 'empty');
+      if (switchedToCookieForImport) {
+        await refreshAndRenderTable();
+      }
       return;
     }
 
@@ -5049,14 +5168,14 @@ async function switchStorageType(storageType) {
     return;
   }
 
+  setBusy(true);
   const canDiscard = await confirmDiscardDirtyEdits('切换类型');
   if (!canDiscard) {
     setStatus('已取消切换', 'empty');
+    setBusy(false);
     return;
   }
 
-  // 确认后立刻持锁，再改全局状态，避免间隙交错
-  setBusy(true);
   setStatus('切换中...');
   try {
     currentStorageType = storageType;
@@ -5103,12 +5222,13 @@ async function handleRefresh() {
   if (isBusy) {
     return;
   }
+  setBusy(true);
   const canDiscard = await confirmDiscardDirtyEdits('刷新');
   if (!canDiscard) {
     setStatus('已取消刷新', 'empty');
+    setBusy(false);
     return;
   }
-  setBusy(true);
   setStatus('刷新中...');
   try {
     await refreshAndRenderTable({ keepDrafts: false });
@@ -5139,56 +5259,58 @@ async function handleClearAll() {
     return;
   }
 
-  const typeLabel = getStorageTypeLabel(currentStorageType);
-  const dirtyRows = collectDirtyRows();
-  // 用当前缓存/表格计数，确认前不刷新，避免「取消清空仍丢编辑」
-  const storedRows = tableRows.filter((row) => !row.isDraft);
-  let count = Math.max(pageKeyCache.length, storedRows.length);
-
-  if (!count) {
-    setStatus(`当前 ${typeLabel} 已为空`, 'empty');
-    return;
-  }
-
-  const previewSource =
-    currentStorageType === STORAGE_TYPES.cookie && pageKeyCache.length
-      ? pageKeyCache
-      : storedRows.map((row) =>
-          currentStorageType === STORAGE_TYPES.cookie ? row.cacheKey || row.originKey || row.key : row.originKey || row.key
-        );
-
-  const previewKeys = previewSource.slice(0, 8).map((key) => {
-    if (currentStorageType === STORAGE_TYPES.cookie) {
-      const detail = cookieDetailCache[key];
-      const name = detail?.name || key;
-      const path = detail?.path || '/';
-      return `- ${name} (path=${path})`;
-    }
-    return `- ${key}`;
-  });
-  const moreTip = count > 8 ? `\n…共 ${count} 条` : '';
-  const dirtyTip = dirtyRows.length
-    ? `\n\n当前有 ${dirtyRows.length} 处未保存编辑/草稿，清空时将一并丢弃。`
-    : '';
-  const cookieTip =
-    currentStorageType === STORAGE_TYPES.cookie
-      ? '\n\n将按每条 Cookie 的 Path/Domain/分区精确删除（含 HttpOnly）。'
-      : '\n\n将调用 clear() 清空当前源下全部条目。';
-
-  const confirmed = await showConfirmDialog({
-    title: `确认清空全部 ${typeLabel}？`,
-    body: `此操作不可恢复，将删除：\n${previewKeys.join('\n')}${moreTip}${dirtyTip}${cookieTip}`,
-    okText: '确认清空',
-    danger: true,
-  });
-  if (!confirmed) {
-    setStatus('已取消清空', 'empty');
-    return;
-  }
-
   setBusy(true);
-  setStatus('清空中...');
   try {
+    const typeLabel = getStorageTypeLabel(currentStorageType);
+    const dirtyRows = collectDirtyRows();
+    // 用当前缓存/表格计数，确认前不刷新，避免「取消清空仍丢编辑」
+    const storedRows = tableRows.filter((row) => !row.isDraft);
+    let count = Math.max(pageKeyCache.length, storedRows.length);
+
+    if (!count) {
+      setStatus(`当前 ${typeLabel} 已为空`, 'empty');
+      return;
+    }
+
+    const previewSource =
+      currentStorageType === STORAGE_TYPES.cookie && pageKeyCache.length
+        ? pageKeyCache
+        : storedRows.map((row) =>
+            currentStorageType === STORAGE_TYPES.cookie
+              ? row.cacheKey || row.originKey || row.key
+              : row.originKey || row.key
+          );
+
+    const previewKeys = previewSource.slice(0, 8).map((key) => {
+      if (currentStorageType === STORAGE_TYPES.cookie) {
+        const detail = cookieDetailCache[key];
+        const name = detail?.name || key;
+        const path = detail?.path || '/';
+        return `- ${name} (path=${path})`;
+      }
+      return `- ${key}`;
+    });
+    const moreTip = count > 8 ? `\n…共 ${count} 条` : '';
+    const dirtyTip = dirtyRows.length
+      ? `\n\n当前有 ${dirtyRows.length} 处未保存编辑/草稿，清空时将一并丢弃。`
+      : '';
+    const cookieTip =
+      currentStorageType === STORAGE_TYPES.cookie
+        ? '\n\n将按每条 Cookie 的 Path/Domain/分区精确删除（含 HttpOnly）。'
+        : '\n\n将调用 clear() 清空当前源下全部条目。';
+
+    const confirmed = await showConfirmDialog({
+      title: `确认清空全部 ${typeLabel}？`,
+      body: `此操作不可恢复，将删除：\n${previewKeys.join('\n')}${moreTip}${dirtyTip}${cookieTip}`,
+      okText: '确认清空',
+      danger: true,
+    });
+    if (!confirmed) {
+      setStatus('已取消清空', 'empty');
+      return;
+    }
+
+    setStatus('清空中...');
     const tab = await getActiveTab();
     assertInjectableTab(tab);
 
@@ -5487,8 +5609,9 @@ async function initPopup() {
         return;
       }
       filterDropdownActiveIndex =
-        (filterDropdownActiveIndex + 1 + filterDropdownFlatOptions.length) %
-        filterDropdownFlatOptions.length;
+        filterDropdownActiveIndex < 0
+          ? 0
+          : (filterDropdownActiveIndex + 1) % filterDropdownFlatOptions.length;
       syncFilterDropdownActiveOption();
       return;
     }
@@ -5501,17 +5624,26 @@ async function initPopup() {
         return;
       }
       filterDropdownActiveIndex =
-        (filterDropdownActiveIndex - 1 + filterDropdownFlatOptions.length) %
-        filterDropdownFlatOptions.length;
+        filterDropdownActiveIndex < 0
+          ? filterDropdownFlatOptions.length - 1
+          : (filterDropdownActiveIndex - 1 + filterDropdownFlatOptions.length) %
+            filterDropdownFlatOptions.length;
       syncFilterDropdownActiveOption();
       return;
     }
-    if (event.key === 'Enter' && filterDropdownOpen && filterDropdownActiveIndex >= 0) {
-      const active = filterDropdownFlatOptions[filterDropdownActiveIndex];
-      if (active) {
-        event.preventDefault();
-        selectFilterSuggestion(active.value);
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      if (filterDropdownOpen && filterDropdownActiveIndex >= 0) {
+        const active = filterDropdownFlatOptions[filterDropdownActiveIndex];
+        if (active) {
+          selectFilterSuggestion(active.value);
+        }
+        return;
       }
+      void applyKeysFilterKeyword(keysFilterInput.value, {
+        pushHistory: true,
+        closeDropdown: true,
+      });
     }
   });
   if (keysFilterDropdown instanceof HTMLElement) {
@@ -5603,7 +5735,7 @@ async function initPopup() {
   // 点击遮罩（dialog 空白区）关闭
   jsonDialog.addEventListener('click', (event) => {
     if (event.target === jsonDialog) {
-      closeJsonDialog();
+      void handleJsonDialogBackdropClose();
     }
   });
   confirmDialog.addEventListener('click', (event) => {
