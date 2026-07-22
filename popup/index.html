@@ -15,11 +15,13 @@
             id="keysFilterInput"
             class="keys-filter"
             type="text"
+            list="keysFilterSuggestions"
             placeholder="筛选 key / 值"
             spellcheck="false"
             autocomplete="off"
             aria-label="筛选 Key 或值"
           />
+          <datalist id="keysFilterSuggestions"></datalist>
           <button id="refreshKeysBtn" class="btn btn-ghost" type="button">刷新</button>
           <button id="viewAllJsonBtn" class="btn btn-ghost" type="button">查看</button>
           <button id="editAllJsonBtn" class="btn btn-ghost" type="button">编辑</button>
@@ -85,14 +87,19 @@
             <input id="cookiePath" class="cookie-control" type="text" value="/" spellcheck="false" />
           </label>
           <label class="cookie-cell">
-            <span class="cookie-cell-label">Max-Age</span>
+            <span class="cookie-cell-label">
+              Max-Age
+              <button id="cookieMakeSessionBtn" class="btn-link" type="button" title="清空过期并写为会话 Cookie">
+                改为会话
+              </button>
+            </span>
             <input
               id="cookieMaxAge"
               class="cookie-control"
               type="number"
               min="0"
-              placeholder="秒，空=会话/保持原过期"
-              title="留空：会话 cookie；若刚读取过带过期的 cookie，则保持原过期时间。填写秒数则按相对时间重写。"
+              placeholder="秒，空=保持原过期/会话"
+              title="填写秒数按相对时间重写；留空且未点「改为会话」时，带过期的条目会保持原过期。点「改为会话」可清掉过期。"
               spellcheck="false"
             />
           </label>

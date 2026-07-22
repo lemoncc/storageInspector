@@ -7,6 +7,8 @@ const STORAGE_TYPES = {
 const DEFAULT_STORAGE_TYPE = STORAGE_TYPES.localStorage;
 const LAST_TYPE_STORAGE = 'last-storage-type';
 const HISTORY_LIMIT = 10;
+/** 筛选关键字历史条数上限 */
+const FILTER_HISTORY_LIMIT = 5;
 const DIFF_PREVIEW_LIMIT = 240;
 /** Chrome 插件 popup 高度实际上限 */
 const CHROME_POPUP_HEIGHT_LIMIT = 600;
@@ -27,6 +29,7 @@ const BLOCKED_URL_PREFIXES = [
 
 const storageTypeTabsEl = document.getElementById('storageTypeTabs');
 const keysFilterInput = document.getElementById('keysFilterInput');
+const keysFilterSuggestions = document.getElementById('keysFilterSuggestions');
 const refreshKeysBtn = document.getElementById('refreshKeysBtn');
 const viewAllJsonBtn = document.getElementById('viewAllJsonBtn');
 const editAllJsonBtn = document.getElementById('editAllJsonBtn');
@@ -41,6 +44,7 @@ const cookieDomainInput = document.getElementById('cookieDomain');
 const cookieSameSiteSelect = document.getElementById('cookieSameSite');
 const cookieSecureCheckbox = document.getElementById('cookieSecure');
 const cookieHttpOnlyCheckbox = document.getElementById('cookieHttpOnly');
+const cookieMakeSessionBtn = document.getElementById('cookieMakeSessionBtn');
 const storageTableBody = document.getElementById('storageTableBody');
 const keysEmptyTipEl = document.getElementById('keysEmptyTip');
 const addRowBtn = document.getElementById('addRowBtn');
@@ -99,6 +103,10 @@ let activeRowId = null;
 let rowIdSeq = 0;
 /** 筛选关键字 */
 let filterKeyword = '';
+/** 当前类型的筛选历史（内存缓存，最近在前） */
+let filterHistoryCache = [];
+/** 筛选 input 序号，丢弃过期的异步回调 */
+let filterInputSeq = 0;
 
 /**
  * 递归格式化还原表：路径 -> { prefix, suffix, original }
@@ -138,6 +146,15 @@ function getLastKeyField(storageType) {
  */
 function getHistoryField(storageType) {
   return `key-history:${storageType}`;
+}
+
+/**
+ * 获取某存储类型筛选关键字历史的缓存字段
+ * @param {string} storageType
+ * @returns {string}
+ */
+function getFilterHistoryField(storageType) {
+  return `filter-history:${storageType}`;
 }
 
 /**
@@ -564,7 +581,8 @@ function assertInjectableTab(tab) {
   }
 
   const isChromeWebStore =
-    parsedUrl.hostname === 'chrome.google.com' && parsedUrl.pathname.startsWith('/webstore');
+    parsedUrl.hostname === 'chromewebstore.google.com' ||
+    (parsedUrl.hostname === 'chrome.google.com' && parsedUrl.pathname.startsWith('/webstore'));
   const isEdgeAddons = parsedUrl.hostname === 'microsoftedge.microsoft.com';
   if (isChromeWebStore || isEdgeAddons) {
     throw new Error('当前页面不支持读写存储（应用商店页）');
@@ -992,6 +1010,19 @@ async function ensureCookieHostPermission(tabUrl) {
 }
 
 /**
+ * getAll 包装：优先带 partitionKey:{} 拉全部分区；旧环境回退
+ * @param {chrome.cookies.GetAllDetails} details
+ * @returns {Promise<chrome.cookies.Cookie[]>}
+ */
+async function cookiesGetAllWithPartition(details) {
+  try {
+    return await chrome.cookies.getAll({ ...details, partitionKey: {} });
+  } catch {
+    return await chrome.cookies.getAll(details);
+  }
+}
+
+/**
  * 收集当前主机相关 cookie（含 HttpOnly、任意 Path/子路由）
  * @param {chrome.tabs.Tab} tab
  * @returns {Promise<chrome.cookies.Cookie[]>}
@@ -1027,16 +1058,19 @@ async function collectTabCookies(tab) {
     });
   };
 
-  // 1. 拉取 store 内全部 cookie，再按主机过滤
+  // 1. 拉取 store 内全部 cookie（含分区罐），再按主机过滤
   // 说明：仅用当前 url 查询时，Path 更具体的子路由 cookie（且 host-only）会被漏掉；
   // domain 查询又拿不到 host-only cookie，所以这里以全量 + 主机过滤为主。
-  const allInStore = await chrome.cookies.getAll(storeId ? { storeId } : {});
+  // partitionKey: {} 会同时返回未分区与 CHIPS 分区 Cookie（Chrome 119+）
+  const allInStore = await cookiesGetAllWithPartition({
+    ...(storeId ? { storeId } : {}),
+  });
   mergeCookies(allInStore);
 
-  // 2. 按路径前缀逐级查询，覆盖子路由 Path
+  // 2. 按路径前缀逐级查询，覆盖子路由 Path（同样打开分区罐）
   for (const prefix of pathPrefixes) {
     const prefixUrl = `${origin}${prefix}`;
-    const byPrefix = await chrome.cookies.getAll({
+    const byPrefix = await cookiesGetAllWithPartition({
       url: prefixUrl,
       ...(storeId ? { storeId } : {}),
     });
@@ -1045,7 +1079,7 @@ async function collectTabCookies(tab) {
 
   // 3. domain 再补一轮（带 Domain 属性的跨子域 cookie）
   for (const domain of domainCandidates) {
-    const byDomain = await chrome.cookies.getAll({
+    const byDomain = await cookiesGetAllWithPartition({
       domain,
       ...(storeId ? { storeId } : {}),
     });
@@ -1054,9 +1088,13 @@ async function collectTabCookies(tab) {
 
   // 4. storeId 异常时兜底
   if (!merged.size) {
-    mergeCookies(await chrome.cookies.getAll({}));
+    mergeCookies(await cookiesGetAllWithPartition({}));
     for (const prefix of pathPrefixes) {
-      mergeCookies(await chrome.cookies.getAll({ url: `${origin}${prefix}` }));
+      mergeCookies(
+        await cookiesGetAllWithPartition({
+          url: `${origin}${prefix}`,
+        })
+      );
     }
   }
 
@@ -1230,10 +1268,12 @@ async function writeCookieViaApi(tab, key, value, options, conflictMode = 'upser
   const nextDomainNorm = (normalizedOptions.domain || '').replace(/^\./, '');
   const nextPartitionSig = serializePartitionKeyPart(normalizedOptions.partitionKey);
 
-  // 写入前清理冲突项，并记住同 identity 的 partitionKey（分区 Cookie 必须带上才能改到同一条）
+  // 先定位同 identity / 待删项；同 identity 不先 remove（set 即可覆盖），避免 set 失败丢数据
   const existingCookies = (await collectTabCookies(tab)).filter((cookie) => cookie.name === key);
   /** @type {chrome.cookies.Cookie | null} */
   let sameIdentityCookie = null;
+  /** @type {chrome.cookies.Cookie[]} */
+  const cookiesToRemoveAfterSet = [];
   for (const cookie of existingCookies) {
     const isSameIdentity = isCookieSameIdentity(
       cookie,
@@ -1243,14 +1283,10 @@ async function writeCookieViaApi(tab, key, value, options, conflictMode = 'upser
     );
     if (isSameIdentity) {
       sameIdentityCookie = cookie;
+      continue;
     }
-    if (conflictMode === 'replace-all-same-name' || isSameIdentity) {
-      await chrome.cookies.remove({
-        url: buildCookieUrl(cookie, tab),
-        name: key,
-        storeId: cookie.storeId,
-        ...buildPartitionKeyField(cookie),
-      });
+    if (conflictMode === 'replace-all-same-name') {
+      cookiesToRemoveAfterSet.push(cookie);
     }
   }
 
@@ -1300,6 +1336,16 @@ async function writeCookieViaApi(tab, key, value, options, conflictMode = 'upser
       error: setError || 'chrome.cookies.set 返回空（可能被浏览器拒绝：Secure/SameSite/Domain/前缀规则等）',
       prefixTip: normalizedOptions.prefixTip,
     };
+  }
+
+  // set 成功后再清理其它同名（仅 replace-all 模式）
+  for (const cookie of cookiesToRemoveAfterSet) {
+    await chrome.cookies.remove({
+      url: buildCookieUrl(cookie, tab),
+      name: key,
+      storeId: cookie.storeId,
+      ...buildPartitionKeyField(cookie),
+    });
   }
 
   const actualHttpOnly = Boolean(result.httpOnly);
@@ -1664,7 +1710,8 @@ function truncateText(text, limit = DIFF_PREVIEW_LIMIT) {
   return `${text.slice(0, limit)}…（共 ${text.length} 字符）`;
 }
 
-function getCookieWriteOptions(preferredCookie = null) {
+function getCookieWriteOptions(preferredCookie = null, options = {}) {
+  const { applySideEffects = true } = options;
   const path = cookiePathInput.value.trim() || '/';
   const maxAgeRaw = cookieMaxAgeInput.value.trim();
   const maxAgeNumber = maxAgeRaw === '' ? null : Number(maxAgeRaw);
@@ -1676,7 +1723,9 @@ function getCookieWriteOptions(preferredCookie = null) {
 
   if (sameSite === 'None') {
     secure = true;
-    cookieSecureCheckbox.checked = true;
+    if (applySideEffects) {
+      cookieSecureCheckbox.checked = true;
+    }
   }
 
   // Max-Age 有值：按相对秒数；否则若有保留的绝对过期则沿用；再否则为会话 cookie
@@ -1697,6 +1746,8 @@ function getCookieWriteOptions(preferredCookie = null) {
 
 /** 确认框嵌套深度：用于连续确认取消时正确释放 busy */
 let confirmDialogDepth = 0;
+/** 行切换互斥，避免 focusin+click 并发弹确认 */
+let rowSwitchLock = Promise.resolve();
 
 function showConfirmDialog(options) {
   const { title, body, okText = '确认', danger = false } = options;
@@ -1706,20 +1757,28 @@ function showConfirmDialog(options) {
   confirmOkBtn.className = danger ? 'btn btn-danger' : 'btn btn-primary';
   confirmDialog.classList.toggle('is-danger', Boolean(danger));
 
+  const wasBusy = isBusy;
   confirmDialogDepth += 1;
   setBusy(true);
 
   return new Promise((resolve) => {
-    const onClose = () => {
-      confirmDialog.removeEventListener('close', onClose);
-      const confirmed = confirmDialog.returnValue === 'ok';
+    const finish = (confirmed) => {
       confirmDialogDepth = Math.max(0, confirmDialogDepth - 1);
-      // 取消：最外层确认结束时必须解除 busy（含「第一次确认、第二次取消」）
-      // 确认：保持 busy，由调用方业务 finally 解除
-      if (!confirmed && confirmDialogDepth === 0) {
-        setBusy(false);
+      if (confirmDialogDepth === 0) {
+        setBusy(wasBusy);
       }
       resolve(confirmed);
+    };
+
+    if (confirmDialog.open) {
+      // 已有确认框：直接拒绝本次，避免 listener 泄漏与 busy 粘死
+      finish(false);
+      return;
+    }
+
+    const onClose = () => {
+      confirmDialog.removeEventListener('close', onClose);
+      finish(confirmDialog.returnValue === 'ok');
     };
     confirmDialog.addEventListener('close', onClose);
     confirmDialog.showModal();
@@ -1982,9 +2041,7 @@ function parseAllDialogPayload(rawText) {
       );
     }
     const cookies = list.map((item) => normalizeImportedCookieItem(item)).filter(Boolean);
-    if (!cookies.length) {
-      throw new Error('没有有效的 cookie 条目');
-    }
+    // 空数组交由上层提示「≠ 清空存储」，避免抛硬错误
     return { mode: 'cookieDetails', cookies };
   }
 
@@ -2339,7 +2396,7 @@ function applyJsonDialogToRow(options = {}) {
   if (closeDialog) {
     closeJsonDialog();
   }
-  setActiveRow(rowId, { syncCookie: true });
+  void setActiveRow(rowId, { syncCookie: true, skipAttrConfirm: true });
   if (!silentStatus) {
     setStatus(
       compressed.minified ? '已压缩并写回行' : '已写回行（非合法 JSON，未压缩）',
@@ -3132,17 +3189,40 @@ function setBusy(busy) {
   importBtn.disabled = busy;
   clearAllBtn.disabled = busy;
   addRowBtn.disabled = busy;
+  keysFilterInput.disabled = busy;
+  // Cookie 属性栏一并锁定，避免写入中改表单
+  [
+    cookiePathInput,
+    cookieMaxAgeInput,
+    cookieDomainInput,
+    cookieSameSiteSelect,
+    cookieSecureCheckbox,
+    cookieHttpOnlyCheckbox,
+    cookieMakeSessionBtn,
+  ].forEach((el) => {
+    if (
+      el instanceof HTMLButtonElement ||
+      el instanceof HTMLInputElement ||
+      el instanceof HTMLSelectElement
+    ) {
+      el.disabled = busy;
+    }
+  });
   // 忙碌时禁止切换类型，避免半写入状态交错
   storageTypeTabsEl.querySelectorAll('.tab-item').forEach((button) => {
     if (button instanceof HTMLButtonElement) {
       button.disabled = busy;
     }
   });
-  storageTableBody.querySelectorAll('[data-action="save"], [data-action="delete"]').forEach((btn) => {
-    if (btn instanceof HTMLButtonElement) {
-      btn.disabled = busy;
-    }
-  });
+  storageTableBody
+    .querySelectorAll(
+      '[data-action="save"], [data-action="delete"], [data-action="edit-json"], [data-action="paste"], .row-key, .row-value'
+    )
+    .forEach((el) => {
+      if (el instanceof HTMLButtonElement || el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+        el.disabled = busy;
+      }
+    });
 }
 
 /**
@@ -3164,6 +3244,114 @@ async function pushKeyHistory(key) {
     [getLastKeyField(currentStorageType)]: trimmed,
     [historyField]: nextList,
   });
+}
+
+/**
+ * 规范化筛选历史列表（最多 FILTER_HISTORY_LIMIT 条）
+ * @param {unknown} list
+ * @returns {string[]}
+ */
+function normalizeFilterHistoryList(list) {
+  if (!Array.isArray(list)) {
+    return [];
+  }
+  return list
+    .filter((item) => typeof item === 'string' && item.trim())
+    .map((item) => item.trim())
+    .slice(0, FILTER_HISTORY_LIMIT);
+}
+
+/**
+ * 从 storage 加载当前类型的筛选历史到内存
+ * @returns {Promise<string[]>}
+ */
+async function loadFilterHistoryCache() {
+  const field = getFilterHistoryField(currentStorageType);
+  const stored = await chrome.storage.local.get(field);
+  filterHistoryCache = normalizeFilterHistoryList(stored[field]);
+  return filterHistoryCache;
+}
+
+/**
+ * 写入筛选历史（去重置顶，最多 5 条）
+ * @param {string} keyword
+ */
+async function pushFilterHistory(keyword) {
+  const trimmed = String(keyword || '').trim();
+  if (!trimmed) {
+    return;
+  }
+  const field = getFilterHistoryField(currentStorageType);
+  const previousList = filterHistoryCache.length
+    ? filterHistoryCache
+    : normalizeFilterHistoryList((await chrome.storage.local.get(field))[field]);
+  const nextList = [trimmed, ...previousList.filter((item) => item !== trimmed)].slice(
+    0,
+    FILTER_HISTORY_LIMIT
+  );
+  filterHistoryCache = nextList;
+  await chrome.storage.local.set({ [field]: nextList });
+  refreshFilterSuggestions();
+}
+
+/**
+ * 收集当前表格去重后的 key 列表（备选）
+ * @returns {string[]}
+ */
+function collectCurrentTableKeysForFilter() {
+  const seen = new Set();
+  const keys = [];
+  for (const row of tableRows) {
+    const keyText = String(row.key || '').trim();
+    if (!keyText || seen.has(keyText)) {
+      continue;
+    }
+    seen.add(keyText);
+    keys.push(keyText);
+  }
+  return keys;
+}
+
+/**
+ * 刷新筛选框 datalist：历史（最多 5）+ 当前 tab 全部 key
+ */
+function refreshFilterSuggestions() {
+  if (!(keysFilterSuggestions instanceof HTMLDataListElement)) {
+    return;
+  }
+  const seen = new Set();
+  const options = [];
+  for (const item of filterHistoryCache) {
+    if (seen.has(item)) {
+      continue;
+    }
+    seen.add(item);
+    options.push(item);
+  }
+  for (const keyText of collectCurrentTableKeysForFilter()) {
+    if (seen.has(keyText)) {
+      continue;
+    }
+    seen.add(keyText);
+    options.push(keyText);
+  }
+  keysFilterSuggestions.innerHTML = options
+    .map((value) => `<option value="${escapeHtml(value)}"></option>`)
+    .join('');
+}
+
+/**
+ * 恢复当前类型的默认筛选：最后一次历史，没有则空
+ * @returns {Promise<void>}
+ */
+async function restoreDefaultFilterKeyword() {
+  await loadFilterHistoryCache();
+  const lastKeyword = filterHistoryCache[0] || '';
+  filterKeyword = lastKeyword;
+  if (keysFilterInput instanceof HTMLInputElement) {
+    keysFilterInput.value = lastKeyword;
+  }
+  refreshFilterSuggestions();
 }
 
 /**
@@ -3354,12 +3542,20 @@ function collectDirtyRows() {
  */
 async function confirmDiscardDirtyEdits(actionLabel) {
   const dirtyRows = collectDirtyRows();
-  if (!dirtyRows.length) {
+  const cookieAttrDirty = isCookieBarDirtyForActiveRow();
+  if (!dirtyRows.length && !cookieAttrDirty) {
     return true;
+  }
+  const parts = [];
+  if (dirtyRows.length) {
+    parts.push(`${dirtyRows.length} 处未保存编辑或草稿`);
+  }
+  if (cookieAttrDirty) {
+    parts.push('当前行 Cookie 属性未保存');
   }
   return showConfirmDialog({
     title: '有未保存的更改',
-    body: `「${actionLabel}」将丢弃 ${dirtyRows.length} 处未保存编辑或草稿。继续？`,
+    body: `「${actionLabel}」将丢弃：${parts.join('；')}。继续？`,
     okText: '继续',
     danger: true,
   });
@@ -3395,18 +3591,18 @@ function buildRowHtml(row) {
   return `<tr class="${classNames}" data-row-id="${escapeHtml(row.rowId)}">
     <td class="col-key">
       <div class="row-key-wrap">
-        <input class="row-key" type="text" spellcheck="false" autocomplete="off" value="${escapeHtml(row.key)}" aria-label="Key" />
+        <input class="row-key" type="text" spellcheck="false" autocomplete="off" value="${escapeHtml(row.key)}" aria-label="Key" ${isBusy ? 'disabled' : ''} />
         ${badgesBlock}
       </div>
     </td>
     <td class="col-value">
-      <textarea class="row-value" spellcheck="false" aria-label="值">${escapeHtml(row.value)}</textarea>
+      <textarea class="row-value" spellcheck="false" aria-label="值" ${isBusy ? 'disabled' : ''}>${escapeHtml(row.value)}</textarea>
     </td>
     <td class="col-actions">
       <div class="row-actions">
-        <button class="btn btn-ghost" type="button" data-action="edit-json" title="以 JSON 格式编辑">编辑</button>
+        <button class="btn btn-ghost" type="button" data-action="edit-json" title="以 JSON 格式编辑" ${isBusy ? 'disabled' : ''}>编辑</button>
         <button class="btn btn-ghost" type="button" data-action="copy" title="复制值">复制</button>
-        <button class="btn btn-ghost" type="button" data-action="paste" title="粘贴到值">粘贴</button>
+        <button class="btn btn-ghost" type="button" data-action="paste" title="粘贴到值" ${isBusy ? 'disabled' : ''}>粘贴</button>
         <button class="btn btn-primary" type="button" data-action="save" ${isBusy ? 'disabled' : ''}>保存</button>
         <button class="btn btn-danger" type="button" data-action="delete" ${isBusy ? 'disabled' : ''}>删除</button>
       </div>
@@ -3499,6 +3695,12 @@ function renderStorageTable() {
   } else {
     keysEmptyTipEl.hidden = true;
   }
+
+  // 重渲染后同步 busy 禁用态（buildRowHtml 只覆盖部分控件）
+  if (isBusy) {
+    setBusy(true);
+  }
+  refreshFilterSuggestions();
 }
 
 /**
@@ -3538,22 +3740,107 @@ function syncCookieBarFromRow(row) {
 }
 
 /**
+ * 当前选中行的 Cookie 属性栏是否相对已写入结果有未保存改动
+ * @returns {boolean}
+ */
+function isCookieBarDirtyForActiveRow() {
+  if (currentStorageType !== STORAGE_TYPES.cookie || !activeRowId) {
+    return false;
+  }
+  const row = tableRows.find((item) => item.rowId === activeRowId);
+  if (!row || row.isDraft) {
+    return false;
+  }
+  const cookie = getCookieDetailForRow(row);
+  if (!cookie) {
+    return false;
+  }
+  const next = getCookieWriteOptions(cookie, { applySideEffects: false });
+  const oldPath = cookie.path || '/';
+  if (oldPath !== (next.path || '/')) {
+    return true;
+  }
+  const oldDomain = cookie.hostOnly ? '' : String(cookie.domain || '').replace(/^\./, '');
+  const nextDomain = (next.domain || '').replace(/^\./, '');
+  if (oldDomain !== nextDomain) {
+    return true;
+  }
+  if (Boolean(cookie.httpOnly) !== Boolean(next.httpOnly)) {
+    return true;
+  }
+  if (Boolean(cookie.secure) !== Boolean(next.secure)) {
+    return true;
+  }
+  if (mapSameSiteFromApi(cookie.sameSite) !== (next.sameSite || '')) {
+    return true;
+  }
+  const oldExpireSig =
+    cookie.session || !cookie.expirationDate
+      ? 'session'
+      : `abs:${Math.floor(cookie.expirationDate)}`;
+  const nextExpireSig =
+    next.maxAge !== null && Number.isFinite(next.maxAge)
+      ? `max:${next.maxAge}`
+      : next.expirationDate != null && Number.isFinite(next.expirationDate)
+        ? `abs:${Math.floor(next.expirationDate)}`
+        : 'session';
+  return oldExpireSig !== nextExpireSig;
+}
+
+/**
  * 设为当前操作行并同步 cookie 属性
  * @param {string | null} rowId
- * @param {{ syncCookie?: boolean }} [options]
+ * @param {{ syncCookie?: boolean, skipAttrConfirm?: boolean }} [options]
+ * @returns {Promise<boolean>} 是否完成切换
  */
-function setActiveRow(rowId, options = {}) {
-  const { syncCookie = true } = options;
-  activeRowId = rowId;
-  storageTableBody.querySelectorAll('tr[data-row-id]').forEach((tr) => {
-    if (!(tr instanceof HTMLTableRowElement)) {
-      return;
+async function setActiveRow(rowId, options = {}) {
+  const run = async () => {
+    const { syncCookie = true, skipAttrConfirm = false } = options;
+
+    if (
+      !skipAttrConfirm &&
+      syncCookie &&
+      currentStorageType === STORAGE_TYPES.cookie &&
+      activeRowId &&
+      rowId !== activeRowId &&
+      isCookieBarDirtyForActiveRow()
+    ) {
+      const confirmed = await showConfirmDialog({
+        title: 'Cookie 属性未保存',
+        body: '当前行的 Cookie 属性已修改但未保存，切换行将丢失这些修改。继续？',
+        okText: '继续切换',
+        danger: true,
+      });
+      if (!confirmed) {
+        setStatus('已取消切换行（请先点「保存」写入属性）', 'empty');
+        return false;
+      }
     }
-    tr.classList.toggle('is-active', tr.dataset.rowId === rowId);
+
+    activeRowId = rowId;
+    storageTableBody.querySelectorAll('tr[data-row-id]').forEach((tr) => {
+      if (!(tr instanceof HTMLTableRowElement)) {
+        return;
+      }
+      tr.classList.toggle('is-active', tr.dataset.rowId === rowId);
+    });
+    if (syncCookie) {
+      const row = tableRows.find((item) => item.rowId === rowId) || null;
+      syncCookieBarFromRow(row);
+    }
+    return true;
+  };
+
+  const previous = rowSwitchLock;
+  let release = () => {};
+  rowSwitchLock = new Promise((resolve) => {
+    release = resolve;
   });
-  if (syncCookie) {
-    const row = tableRows.find((item) => item.rowId === rowId) || null;
-    syncCookieBarFromRow(row);
+  await previous;
+  try {
+    return await run();
+  } finally {
+    release();
   }
 }
 
@@ -3615,8 +3902,14 @@ async function refreshAndRenderTable(options = {}) {
 
   activeRowId = nextActiveId;
   renderStorageTable();
+  // 若默认/残留筛选把选中行滤掉，改落到首条可见行
+  const visibleRows = tableRows.filter(isRowMatchFilter);
+  if (nextActiveId && !visibleRows.some((row) => row.rowId === nextActiveId)) {
+    nextActiveId = visibleRows[0]?.rowId || null;
+    activeRowId = nextActiveId;
+  }
   if (nextActiveId) {
-    setActiveRow(nextActiveId, { syncCookie: true });
+    await setActiveRow(nextActiveId, { syncCookie: true, skipAttrConfirm: true });
   } else if (currentStorageType === STORAGE_TYPES.cookie) {
     clearCookiePreservedExpiration();
   }
@@ -3627,19 +3920,20 @@ async function refreshAndRenderTable(options = {}) {
 /**
  * 追加草稿空行
  */
-function handleAddRow() {
+async function handleAddRow() {
   if (isBusy) {
     return;
   }
   const draft = createDraftRow();
   tableRows.push(draft);
-  activeRowId = draft.rowId;
   renderStorageTable();
-  setActiveRow(draft.rowId, { syncCookie: true });
-  const keyInput = getRowKeyInput(draft.rowId);
-  if (keyInput) {
-    keyInput.focus();
+  const switched = await setActiveRow(draft.rowId, { syncCookie: true });
+  if (!switched) {
+    tableRows = tableRows.filter((row) => row.rowId !== draft.rowId);
+    renderStorageTable();
+    return;
   }
+  getRowKeyInput(draft.rowId)?.focus();
   setStatus('已追加草稿行，填写后点保存写入', 'empty');
 }
 
@@ -3721,7 +4015,7 @@ async function readExistingForSave(tab, key, row) {
   if (currentStorageType === STORAGE_TYPES.cookie) {
     // 精确 identity：同 path+domain+partition 才算覆盖同一条
     const preferredCookie = getCookieDetailForRow(row);
-    const cookieOptions = getCookieWriteOptions(preferredCookie);
+    const cookieOptions = getCookieWriteOptions(preferredCookie, { applySideEffects: false });
     const all = await collectTabCookies(tab);
     const nextPath = cookieOptions.path || '/';
     const nextDomainNorm = (cookieOptions.domain || '').replace(/^\./, '');
@@ -3806,12 +4100,13 @@ async function handleRowSave(rowId) {
       : null;
 
   try {
+    setBusy(true);
     const tab = await getActiveTab();
     assertInjectableTab(tab);
 
     const cookieOptionsPreview =
       currentStorageType === STORAGE_TYPES.cookie
-        ? getCookieWriteOptions(oldCookieDetail)
+        ? getCookieWriteOptions(oldCookieDetail, { applySideEffects: false })
         : null;
 
     let cookieIdentityChanged = false;
@@ -3883,6 +4178,39 @@ async function handleRowSave(rowId) {
           cookieAttrLines.push(
             `SameSite：${oldSameSite || '默认'} → ${cookieOptionsPreview.sameSite || '默认'}`
           );
+        }
+        // Max-Age / 过期意图变更
+        const oldExpireTip =
+          oldCookie.session || !oldCookie.expirationDate
+            ? '会话'
+            : `过期至 ${new Date(oldCookie.expirationDate * 1000).toLocaleString()}`;
+        let nextExpireTip = '会话';
+        if (
+          cookieOptionsPreview.maxAge !== null &&
+          cookieOptionsPreview.maxAge !== undefined &&
+          Number.isFinite(cookieOptionsPreview.maxAge)
+        ) {
+          nextExpireTip = `Max-Age=${cookieOptionsPreview.maxAge}秒`;
+        } else if (
+          cookieOptionsPreview.expirationDate !== null &&
+          cookieOptionsPreview.expirationDate !== undefined &&
+          Number.isFinite(cookieOptionsPreview.expirationDate)
+        ) {
+          nextExpireTip = `保持过期至 ${new Date(cookieOptionsPreview.expirationDate * 1000).toLocaleString()}`;
+        }
+        const oldExpireSig =
+          oldCookie.session || !oldCookie.expirationDate
+            ? 'session'
+            : `abs:${Math.floor(oldCookie.expirationDate)}`;
+        const nextExpireSig =
+          cookieOptionsPreview.maxAge !== null && Number.isFinite(cookieOptionsPreview.maxAge)
+            ? `max:${cookieOptionsPreview.maxAge}`
+            : cookieOptionsPreview.expirationDate != null &&
+                Number.isFinite(cookieOptionsPreview.expirationDate)
+              ? `abs:${Math.floor(cookieOptionsPreview.expirationDate)}`
+              : 'session';
+        if (oldExpireSig !== nextExpireSig) {
+          cookieAttrLines.push(`过期：${oldExpireTip} → ${nextExpireTip}`);
         }
       }
 
@@ -3963,18 +4291,17 @@ async function handleRowSave(rowId) {
       }
     }
 
-    setBusy(true);
-    if (prepared.usedFallback) {
-      setStatus('已回退格式化前原文并压缩，写入中...');
-    } else if (keptEditsOnWrite) {
-      setStatus(`已按编辑重序列化 ${prepared.restoredCount} 处并压缩，写入中...`);
-    } else if (prepared.restoredCount > 0) {
-      setStatus(`已还原 ${prepared.restoredCount} 处并压缩，写入中...`);
-    } else if (prepared.minified) {
-      setStatus('已压缩，写入中...');
-    } else {
-      setStatus('写入中...');
-    }
+    setStatus(
+      prepared.usedFallback
+        ? '已回退格式化前原文并压缩，写入中...'
+        : keptEditsOnWrite
+          ? `已按编辑重序列化 ${prepared.restoredCount} 处并压缩，写入中...`
+          : prepared.restoredCount > 0
+            ? `已还原 ${prepared.restoredCount} 处并压缩，写入中...`
+            : prepared.minified
+              ? '已压缩，写入中...'
+              : '写入中...'
+    );
 
     const cookieOptions =
       currentStorageType === STORAGE_TYPES.cookie
@@ -4138,7 +4465,7 @@ async function handleRowDelete(rowId) {
     }
     renderStorageTable();
     if (activeRowId) {
-      setActiveRow(activeRowId);
+      void setActiveRow(activeRowId, { skipAttrConfirm: true });
     }
     setStatus('已移除草稿行', 'success');
     return;
@@ -4153,6 +4480,7 @@ async function handleRowDelete(rowId) {
   const typeLabel = getStorageTypeLabel(currentStorageType);
 
   try {
+    setBusy(true);
     const tab = await getActiveTab();
     assertInjectableTab(tab);
 
@@ -4181,19 +4509,16 @@ async function handleRowDelete(rowId) {
     let cookieOptions;
     if (currentStorageType === STORAGE_TYPES.cookie) {
       const cookie = getCookieDetailForRow(row);
-      // 删除前把该行属性同步到栏，保证 Path/Domain 精确匹配
-      if (cookie) {
-        applyCookieDetailsToForm(cookie);
-      }
-      const writeOptions = getCookieWriteOptions(cookie);
+      // 用缓存详情构造删除选项，确认前不回写属性栏，避免取消删除时冲掉未保存属性
       cookieOptions = {
-        path: writeOptions.path,
-        domain: writeOptions.domain,
+        path: cookie?.path || '/',
+        domain: cookie?.hostOnly ? '' : cookie?.domain || '',
         partitionKey: cookie?.partitionKey,
       };
       body += `\n\n将按 Path=${cookieOptions.path}${cookieOptions.domain ? ` Domain=${cookieOptions.domain}` : '（host-only）'} 精确删除。`;
     }
 
+    setBusy(true);
     const confirmed = await showConfirmDialog({
       title: `确认删除 ${typeLabel} / ${key}？`,
       body,
@@ -4205,7 +4530,6 @@ async function handleRowDelete(rowId) {
       return;
     }
 
-    setBusy(true);
     setStatus('删除中...');
 
     const pageData = await deleteStorageValue(tab, currentStorageType, key, cookieOptions);
@@ -4301,6 +4625,17 @@ async function handleImportFile(file) {
     return;
   }
 
+  const canDiscard = await confirmDiscardDirtyEdits('导入');
+  if (!canDiscard) {
+    setStatus('已取消导入', 'empty');
+    return;
+  }
+
+  // 丢弃确认通过后立即持锁，覆盖后续解析与二次确认间隙
+  setBusy(true);
+  setStatus('导入准备中...');
+  const importTargetType = currentStorageType;
+
   try {
     const text = await file.text();
     let payload = parseImportPayload(text);
@@ -4331,10 +4666,10 @@ async function handleImportFile(file) {
       }
     }
 
-    if (payload.type && payload.type !== currentStorageType) {
+    if (payload.type && payload.type !== importTargetType) {
       const confirmedType = await showConfirmDialog({
         title: '导入类型不一致',
-        body: `文件类型是「${payload.type}」，当前是「${currentStorageType}」。仍要导入到当前类型吗？`,
+        body: `文件类型是「${payload.type}」，当前是「${importTargetType}」。仍要导入到当前类型吗？`,
         okText: '继续导入',
         danger: true,
       });
@@ -4342,6 +4677,10 @@ async function handleImportFile(file) {
         setStatus('已取消导入', 'empty');
         return;
       }
+    }
+
+    if (currentStorageType !== importTargetType) {
+      throw new Error('导入期间存储类型已变化，已取消');
     }
 
     let preview = '';
@@ -4365,7 +4704,7 @@ async function handleImportFile(file) {
       : '';
 
     const confirmed = await showConfirmDialog({
-      title: `确认导入到 ${getStorageTypeLabel(currentStorageType)}？`,
+      title: `确认导入到 ${getStorageTypeLabel(importTargetType)}？`,
       body: `将写入 / 覆盖以下条目：\n${preview}${moreTip}${skipTip}`,
       okText: '确认导入',
       danger: true,
@@ -4375,21 +4714,24 @@ async function handleImportFile(file) {
       return;
     }
 
-    setBusy(true);
+    if (currentStorageType !== importTargetType) {
+      throw new Error('导入期间存储类型已变化，已取消');
+    }
+
     setStatus('导入中...');
 
     const tab = await getActiveTab();
     assertInjectableTab(tab);
 
     let result;
-    if (currentStorageType === STORAGE_TYPES.cookie && payload.mode === 'cookieDetails') {
+    if (importTargetType === STORAGE_TYPES.cookie && payload.mode === 'cookieDetails') {
       result = await writeCookiesDetailedBatchViaApi(tab, payload.cookies);
-    } else if (currentStorageType === STORAGE_TYPES.cookie) {
-      const cookieOptions = getCookieWriteOptions();
+    } else if (importTargetType === STORAGE_TYPES.cookie) {
+      const cookieOptions = getCookieWriteOptions(null, { applySideEffects: false });
       result = await writeCookiesBatchViaApi(tab, payload.entries, cookieOptions);
     } else if (payload.mode === 'entries') {
       result = await executeInTab(tab.id, writePageStorageBatch, [
-        currentStorageType,
+        importTargetType,
         payload.entries,
         null,
       ]);
@@ -4431,22 +4773,24 @@ async function switchStorageType(storageType) {
     return;
   }
 
-  currentStorageType = storageType;
-  renderActiveTab();
-  pageKeyCache = [];
-  pageEntriesCache = {};
-  cookieDetailCache = {};
-  clearCookiePreservedExpiration();
-  cookieMaxAgeInput.value = '';
-  clearFormatStateForUi();
-  tableRows = [];
-  activeRowId = null;
-
-  await chrome.storage.local.set({ [LAST_TYPE_STORAGE]: storageType });
-
+  // 确认后立刻持锁，再改全局状态，避免间隙交错
   setBusy(true);
   setStatus('切换中...');
   try {
+    currentStorageType = storageType;
+    renderActiveTab();
+    pageKeyCache = [];
+    pageEntriesCache = {};
+    cookieDetailCache = {};
+    clearCookiePreservedExpiration();
+    cookieMaxAgeInput.value = '';
+    clearFormatStateForUi();
+    tableRows = [];
+    activeRowId = null;
+
+    await chrome.storage.local.set({ [LAST_TYPE_STORAGE]: storageType });
+
+    await restoreDefaultFilterKeyword();
     const pageData = await refreshAndRenderTable();
     if (currentStorageType === STORAGE_TYPES.cookie) {
       const httpOnlyCount = Object.values(cookieDetailCache).filter((item) => item.httpOnly).length;
@@ -4513,33 +4857,25 @@ async function handleClearAll() {
     return;
   }
 
-  const canDiscard = await confirmDiscardDirtyEdits('清空');
-  if (!canDiscard) {
-    setStatus('已取消清空', 'empty');
-    return;
-  }
-
   const typeLabel = getStorageTypeLabel(currentStorageType);
-
-  // 用户已同意丢弃编辑后再刷新核对数量（取消清空时编辑已丢，属确认后预期）
-  setBusy(true);
-  setStatus('核对条目中...');
-  let count = pageKeyCache.length;
-  try {
-    await refreshAndRenderTable({ keepDrafts: false });
-    count = pageKeyCache.length;
-  } catch {
-    // 刷新失败仍允许按当前缓存确认
-  } finally {
-    setBusy(false);
-  }
+  const dirtyRows = collectDirtyRows();
+  // 用当前缓存/表格计数，确认前不刷新，避免「取消清空仍丢编辑」
+  const storedRows = tableRows.filter((row) => !row.isDraft);
+  let count = Math.max(pageKeyCache.length, storedRows.length);
 
   if (!count) {
     setStatus(`当前 ${typeLabel} 已为空`, 'empty');
     return;
   }
 
-  const previewKeys = pageKeyCache.slice(0, 8).map((key) => {
+  const previewSource =
+    currentStorageType === STORAGE_TYPES.cookie && pageKeyCache.length
+      ? pageKeyCache
+      : storedRows.map((row) =>
+          currentStorageType === STORAGE_TYPES.cookie ? row.cacheKey || row.originKey || row.key : row.originKey || row.key
+        );
+
+  const previewKeys = previewSource.slice(0, 8).map((key) => {
     if (currentStorageType === STORAGE_TYPES.cookie) {
       const detail = cookieDetailCache[key];
       const name = detail?.name || key;
@@ -4549,6 +4885,9 @@ async function handleClearAll() {
     return `- ${key}`;
   });
   const moreTip = count > 8 ? `\n…共 ${count} 条` : '';
+  const dirtyTip = dirtyRows.length
+    ? `\n\n当前有 ${dirtyRows.length} 处未保存编辑/草稿，清空时将一并丢弃。`
+    : '';
   const cookieTip =
     currentStorageType === STORAGE_TYPES.cookie
       ? '\n\n将按每条 Cookie 的 Path/Domain/分区精确删除（含 HttpOnly）。'
@@ -4556,7 +4895,7 @@ async function handleClearAll() {
 
   const confirmed = await showConfirmDialog({
     title: `确认清空全部 ${typeLabel}？`,
-    body: `此操作不可恢复，将删除：\n${previewKeys.join('\n')}${moreTip}${cookieTip}`,
+    body: `此操作不可恢复，将删除：\n${previewKeys.join('\n')}${moreTip}${dirtyTip}${cookieTip}`,
     okText: '确认清空',
     danger: true,
   });
@@ -4574,7 +4913,7 @@ async function handleClearAll() {
     if (currentStorageType === STORAGE_TYPES.cookie) {
       const result = await clearAllCookiesViaApi(tab);
       clearFormatStateForUi();
-      await refreshAndRenderTable();
+      await refreshAndRenderTable({ keepDrafts: false });
       if (result.failCount > 0) {
         setStatus(
           `清空完成：成功 ${result.successCount}，失败 ${result.failCount}`,
@@ -4588,7 +4927,7 @@ async function handleClearAll() {
 
     const result = await executeInTab(tab.id, clearPageStorage, [currentStorageType]);
     clearFormatStateForUi();
-    await refreshAndRenderTable();
+    await refreshAndRenderTable({ keepDrafts: false });
     if (!result.success) {
       setStatus(
         `清空未完成：仍剩余 ${result.remainCount ?? '?'} 条`,
@@ -4608,9 +4947,16 @@ async function handleClearAll() {
  * tbody 事件委托：行操作
  * @param {MouseEvent} event
  */
-function handleTableClick(event) {
+async function handleTableClick(event) {
   const target = event.target;
   if (!(target instanceof HTMLElement)) {
+    return;
+  }
+
+  const actionBtn = target.closest('[data-action]');
+  const action = actionBtn instanceof HTMLElement ? actionBtn.dataset.action : '';
+  // 复制为只读，busy 时仍允许
+  if (isBusy && action !== 'copy') {
     return;
   }
 
@@ -4621,16 +4967,17 @@ function handleTableClick(event) {
   const rowId = tr.dataset.rowId;
 
   // 点击行设为 active
-  if (rowId !== activeRowId) {
-    setActiveRow(rowId);
+  if (rowId !== activeRowId && !isBusy) {
+    const switched = await setActiveRow(rowId);
+    if (!switched) {
+      return;
+    }
   }
 
-  const actionBtn = target.closest('[data-action]');
-  if (!(actionBtn instanceof HTMLElement) || !actionBtn.dataset.action) {
+  if (!(actionBtn instanceof HTMLElement) || !action) {
     return;
   }
 
-  const action = actionBtn.dataset.action;
   if (action === 'edit-json') {
     openJsonDialog(rowId, 'edit');
   } else if (action === 'copy') {
@@ -4649,6 +4996,9 @@ function handleTableClick(event) {
  * @param {FocusEvent} event
  */
 function handleTableFocusIn(event) {
+  if (isBusy) {
+    return;
+  }
   const target = event.target;
   if (!(target instanceof HTMLElement)) {
     return;
@@ -4657,9 +5007,20 @@ function handleTableFocusIn(event) {
   if (!(tr instanceof HTMLTableRowElement) || !tr.dataset.rowId) {
     return;
   }
-  if (tr.dataset.rowId !== activeRowId) {
-    setActiveRow(tr.dataset.rowId);
+  const nextRowId = tr.dataset.rowId;
+  if (nextRowId === activeRowId) {
+    return;
   }
+  void (async () => {
+    const previousId = activeRowId;
+    const switched = await setActiveRow(nextRowId);
+    if (!switched && previousId) {
+      // 取消切换：尽量把焦点拉回原行
+      const keyInput = getRowKeyInput(previousId);
+      const valueInput = getRowValueTextarea(previousId);
+      (keyInput || valueInput)?.focus();
+    }
+  })();
 }
 
 /**
@@ -4667,6 +5028,9 @@ function handleTableFocusIn(event) {
  * @param {Event} event
  */
 function handleTableInput(event) {
+  if (isBusy) {
+    return;
+  }
   const target = event.target;
   if (!(target instanceof HTMLElement)) {
     return;
@@ -4791,13 +5155,42 @@ async function initPopup() {
 
   refreshKeysBtn.addEventListener('click', handleRefresh);
   keysFilterInput.addEventListener('input', () => {
-    filterKeyword = keysFilterInput.value;
-    // 筛选前把可见行 DOM 值写回，避免丢编辑
-    tableRows.forEach((row) => syncRowModelFromDom(row.rowId));
-    renderStorageTable();
-    if (activeRowId) {
-      setActiveRow(activeRowId, { syncCookie: false });
-    }
+    const seq = ++filterInputSeq;
+    const keywordSnapshot = keysFilterInput.value;
+    void (async () => {
+      filterKeyword = keywordSnapshot;
+      tableRows.forEach((row) => syncRowModelFromDom(row.rowId));
+      if (seq !== filterInputSeq) {
+        return;
+      }
+      renderStorageTable();
+      const visibleRows = tableRows.filter(isRowMatchFilter);
+      if (activeRowId && !visibleRows.some((row) => row.rowId === activeRowId)) {
+        const nextId = visibleRows[0]?.rowId || null;
+        const previousActiveId = activeRowId;
+        const switched = await setActiveRow(nextId, { syncCookie: true });
+        if (seq !== filterInputSeq) {
+          return;
+        }
+        if (!switched) {
+          // 取消：恢复该次筛选前的关键字意图（清空筛选以继续编辑）
+          keysFilterInput.value = '';
+          filterKeyword = '';
+          filterInputSeq += 1;
+          renderStorageTable();
+          void setActiveRow(previousActiveId, { syncCookie: false, skipAttrConfirm: true });
+        }
+      } else if (activeRowId) {
+        void setActiveRow(activeRowId, { syncCookie: false, skipAttrConfirm: true });
+      }
+    })();
+  });
+  // 选中备选或失焦时写入筛选历史
+  keysFilterInput.addEventListener('change', () => {
+    void pushFilterHistory(keysFilterInput.value);
+  });
+  keysFilterInput.addEventListener('blur', () => {
+    void pushFilterHistory(keysFilterInput.value);
   });
 
   exportBtn.addEventListener('click', handleExport);
@@ -4902,6 +5295,17 @@ async function initPopup() {
       );
     }
   });
+  if (cookieMakeSessionBtn instanceof HTMLButtonElement) {
+    cookieMakeSessionBtn.addEventListener('click', () => {
+      cookieMaxAgeInput.value = '';
+      clearCookiePreservedExpiration();
+      cookieMaxAgeInput.placeholder = '秒，空=会话';
+      cookieMaxAgeInput.title = '已设为会话 Cookie：保存后将去掉绝对过期时间';
+      if (currentStorageType === STORAGE_TYPES.cookie) {
+        setStatus('已标记为会话 Cookie，请点击对应行的「保存」写入', 'empty');
+      }
+    });
+  }
   cookiePathInput.addEventListener('change', () => {
     if (currentStorageType === STORAGE_TYPES.cookie) {
       setStatus('Cookie 属性已修改，请点击对应行的「保存」写入', 'empty');
@@ -4921,6 +5325,7 @@ async function initPopup() {
   setBusy(true);
   setStatus('加载中...');
   try {
+    await restoreDefaultFilterKeyword();
     await refreshAndRenderTable();
     if (currentStorageType === STORAGE_TYPES.cookie) {
       const httpOnlyCount = Object.values(cookieDetailCache).filter((item) => item.httpOnly).length;

@@ -194,9 +194,27 @@ body {
 }
 
 .cookie-cell-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 11px;
   line-height: 1;
   color: #64748b;
+}
+
+.btn-link {
+  border: none;
+  padding: 0;
+  background: transparent;
+  color: #2563eb;
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.btn-link:hover {
+  color: #1d4ed8;
 }
 
 .cookie-control {
