@@ -57,7 +57,10 @@ const jsonDialogMetaEl = document.getElementById('jsonDialogMeta');
 const jsonFormatBtn = document.getElementById('jsonFormatBtn');
 const jsonCompressBtn = document.getElementById('jsonCompressBtn');
 const jsonCopyBtn = document.getElementById('jsonCopyBtn');
-const jsonApplyBtn = document.getElementById('jsonApplyBtn');
+const jsonPasteBtn = document.getElementById('jsonPasteBtn');
+const jsonClearBtn = document.getElementById('jsonClearBtn');
+const jsonSaveBtn = document.getElementById('jsonSaveBtn');
+const jsonDeleteBtn = document.getElementById('jsonDeleteBtn');
 
 /** @type {string} */
 let currentStorageType = DEFAULT_STORAGE_TYPE;
@@ -1662,13 +1665,17 @@ function syncJsonDialogControls() {
   jsonDialogEditor.readOnly = !isEdit;
   jsonFormatBtn.hidden = !isEdit;
   jsonCompressBtn.hidden = !isEdit;
-  jsonApplyBtn.hidden = !isEdit;
+  jsonPasteBtn.hidden = !isEdit;
+  jsonClearBtn.hidden = !isEdit;
+  jsonSaveBtn.hidden = !isEdit;
+  // 删除仅单行编辑有意义
+  jsonDeleteBtn.hidden = !isEdit || jsonDialogScope !== 'row';
   if (jsonDialogScope === 'all') {
     jsonDialogTitleEl.textContent = isEdit ? '全部 JSON 编辑' : '全部 JSON 查看';
-    jsonApplyBtn.textContent = '写入全部';
+    jsonSaveBtn.textContent = '写入全部';
   } else {
     jsonDialogTitleEl.textContent = isEdit ? 'JSON 编辑' : 'JSON 查看';
-    jsonApplyBtn.textContent = '应用到行';
+    jsonSaveBtn.textContent = '保存';
   }
 }
 
@@ -1776,7 +1783,7 @@ function openJsonDialog(rowId, mode) {
   const sourceText = getRowValueTextarea(rowId)?.value ?? row.value ?? '';
   const pretty = tryPrettyJsonText(sourceText);
 
-  // 打开编辑时清掉旧格式化态，避免「应用到行」误用上次的 preFormatRootText
+  // 打开编辑时清掉旧格式化态，避免保存时误用上次的 preFormatRootText
   clearFormatStateForUi();
 
   jsonDialogScope = 'row';
@@ -1965,6 +1972,50 @@ async function handleJsonDialogCopy() {
 }
 
 /**
+ * 粘贴到 JSON 弹窗编辑器（仅编辑模式）
+ */
+async function handleJsonDialogPaste() {
+  if (jsonDialogMode !== 'edit') {
+    return;
+  }
+  try {
+    let text = '';
+    if (navigator.clipboard?.readText) {
+      text = await navigator.clipboard.readText();
+    } else {
+      setStatus('当前环境不支持读取剪贴板，请在编辑框内按 Ctrl/Cmd + V', 'error');
+      jsonDialogEditor.focus();
+      return;
+    }
+    if (!text) {
+      setStatus('剪贴板为空（或非文本内容）', 'empty');
+      return;
+    }
+    const formatTargetId = getJsonDialogFormatTargetId();
+    if (formatBoundRowId && formatTargetId && formatBoundRowId === formatTargetId) {
+      clearFormatStateForUi();
+    }
+    jsonDialogEditor.value = text;
+    let isJson = false;
+    try {
+      JSON.parse(text.trim());
+      isJson = true;
+    } catch {
+      isJson = false;
+    }
+    updateJsonDialogMeta(text, isJson);
+    setStatus(`已粘贴，长度 ${text.length}`, 'success');
+    jsonDialogEditor.focus();
+  } catch {
+    setStatus(
+      '粘贴失败：请重新加载扩展后再试，或直接在编辑框按 Ctrl/Cmd + V',
+      'error'
+    );
+    jsonDialogEditor.focus();
+  }
+}
+
+/**
  * 若文本是合法 JSON，则压缩为一行；否则原样返回
  * @param {string} text
  * @returns {{ text: string, minified: boolean }}
@@ -1984,10 +2035,13 @@ function compressTextIfJson(text) {
 
 /**
  * 将弹窗内容写回表格行（合法 JSON 强制压缩；不直接写入页面存储）
+ * @param {{ closeDialog?: boolean, silentStatus?: boolean }} [options]
+ * @returns {string | null} 成功返回 rowId
  */
-function handleJsonDialogApplyRow() {
+function applyJsonDialogToRow(options = {}) {
+  const { closeDialog = true, silentStatus = false } = options;
   if (jsonDialogMode !== 'edit' || jsonDialogScope !== 'row' || !jsonDialogRowId) {
-    return;
+    return null;
   }
 
   // 先固定 rowId / 原文，避免 close 事件把状态清空后取不到
@@ -2031,23 +2085,28 @@ function handleJsonDialogApplyRow() {
   if (textarea) {
     textarea.value = text;
   } else if (!row) {
-    setStatus('目标行不存在，无法应用', 'error');
-    closeJsonDialog();
-    return;
+    setStatus('目标行不存在，无法写回', 'error');
+    if (closeDialog) {
+      closeJsonDialog();
+    }
+    return null;
   } else {
     // 行被筛选隐藏：写回模型后重渲染
     renderStorageTable();
   }
 
   clearFormatStateForUi();
-  closeJsonDialog();
+  if (closeDialog) {
+    closeJsonDialog();
+  }
   setActiveRow(rowId, { syncCookie: true });
-  setStatus(
-    compressed.minified
-      ? '已压缩并应用到行，点击「保存」写入页面存储'
-      : '已应用到行（非合法 JSON，未压缩），点击「保存」写入页面存储',
-    compressed.minified ? 'success' : 'empty'
-  );
+  if (!silentStatus) {
+    setStatus(
+      compressed.minified ? '已压缩并写回行' : '已写回行（非合法 JSON，未压缩）',
+      compressed.minified ? 'success' : 'empty'
+    );
+  }
+  return rowId;
 }
 
 /**
@@ -2144,12 +2203,59 @@ async function handleJsonDialogApplyAll() {
 /**
  * JSON 弹窗「应用」：按作用域分流
  */
-function handleJsonDialogApply() {
-  if (jsonDialogScope === 'all') {
-    handleJsonDialogApplyAll();
+/**
+ * 弹窗「保存」：单行=压缩写回行后写入页面存储；全部=写入全部
+ */
+async function handleJsonDialogSave() {
+  if (jsonDialogMode !== 'edit') {
     return;
   }
-  handleJsonDialogApplyRow();
+  if (jsonDialogScope === 'all') {
+    await handleJsonDialogApplyAll();
+    return;
+  }
+
+  const rowId = jsonDialogRowId;
+  if (!rowId) {
+    setStatus('没有可保存的行', 'error');
+    return;
+  }
+
+  // 先压缩写回表格行并关闭弹窗，再走行内保存（含确认）
+  const appliedRowId = applyJsonDialogToRow({ closeDialog: true, silentStatus: true });
+  if (!appliedRowId) {
+    return;
+  }
+  await handleRowSave(appliedRowId);
+}
+
+/**
+ * 弹窗「清空」：清空编辑器内容（不改页面存储）
+ */
+function handleJsonDialogClear() {
+  if (jsonDialogMode !== 'edit') {
+    return;
+  }
+  const formatTargetId = getJsonDialogFormatTargetId();
+  if (formatBoundRowId && formatTargetId && formatBoundRowId === formatTargetId) {
+    clearFormatStateForUi();
+  }
+  jsonDialogEditor.value = jsonDialogScope === 'all' ? '{\n}' : '';
+  updateJsonDialogMeta(jsonDialogEditor.value, jsonDialogScope === 'all');
+  setStatus('已清空编辑内容（尚未写入存储）', 'empty');
+  jsonDialogEditor.focus();
+}
+
+/**
+ * 弹窗「删除」：关闭弹窗后删除当前行对应存储
+ */
+async function handleJsonDialogDelete() {
+  if (jsonDialogMode !== 'edit' || jsonDialogScope !== 'row' || !jsonDialogRowId) {
+    return;
+  }
+  const rowId = jsonDialogRowId;
+  closeJsonDialog();
+  await handleRowDelete(rowId);
 }
 
 function normalizeHistoryList(list) {
@@ -4248,9 +4354,21 @@ async function initPopup() {
   jsonFormatBtn.addEventListener('click', handleJsonDialogFormat);
   jsonCompressBtn.addEventListener('click', handleJsonDialogCompress);
   jsonCopyBtn.addEventListener('click', handleJsonDialogCopy);
-  jsonApplyBtn.addEventListener('click', (event) => {
+  jsonPasteBtn.addEventListener('click', (event) => {
     event.preventDefault();
-    handleJsonDialogApply();
+    handleJsonDialogPaste();
+  });
+  jsonClearBtn.addEventListener('click', (event) => {
+    event.preventDefault();
+    handleJsonDialogClear();
+  });
+  jsonSaveBtn.addEventListener('click', (event) => {
+    event.preventDefault();
+    handleJsonDialogSave();
+  });
+  jsonDeleteBtn.addEventListener('click', (event) => {
+    event.preventDefault();
+    handleJsonDialogDelete();
   });
   jsonDialog.addEventListener('close', () => {
     jsonDialogRowId = null;
