@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "应用存储管理",
-  "version": "2.1.5",
+  "version": "2.1.6",
   "description": "管理当前页面的 localStorage、sessionStorage 与 Cookie（含 HttpOnly）：表格化浏览与编辑，支持行内读写删、格式化、导入导出",
   "permissions": ["activeTab", "scripting", "storage", "cookies", "clipboardRead", "clipboardWrite"],
   "host_permissions": ["http://*/*", "https://*/*"],

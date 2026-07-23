@@ -663,14 +663,17 @@ function buildRouteInfoFromTab(tab) {
  * @returns {chrome.cookies.SameSiteStatus | undefined}
  */
 function mapSameSiteToApi(sameSite) {
-  if (sameSite === 'Lax') {
+  if (sameSite === 'Lax' || sameSite === 'lax') {
     return 'lax';
   }
-  if (sameSite === 'Strict') {
+  if (sameSite === 'Strict' || sameSite === 'strict') {
     return 'strict';
   }
-  if (sameSite === 'None') {
+  if (sameSite === 'None' || sameSite === 'no_restriction') {
     return 'no_restriction';
+  }
+  if (sameSite === 'unspecified') {
+    return 'unspecified';
   }
   return undefined;
 }
@@ -690,6 +693,7 @@ function mapSameSiteFromApi(sameSite) {
   if (sameSite === 'no_restriction') {
     return 'None';
   }
+  // unspecified 在表单无对应项，显示为「默认」；cookies[] 导入另路保留
   return '';
 }
 
@@ -792,11 +796,17 @@ function normalizeImportedCookieItem(item) {
       ? item.domain.trim()
       : '';
   const sameSiteRaw = typeof item.sameSite === 'string' ? item.sameSite : '';
-  // 兼容 API 小写与表单大写
-  const sameSite =
-    sameSiteRaw === 'lax' || sameSiteRaw === 'strict' || sameSiteRaw === 'no_restriction'
-      ? mapSameSiteFromApi(sameSiteRaw)
-      : sameSiteRaw;
+  // 兼容 API 小写、表单大写；unspecified 原样保留以便 set 时写回
+  let sameSite = sameSiteRaw;
+  if (sameSiteRaw === 'unspecified') {
+    sameSite = 'unspecified';
+  } else if (
+    sameSiteRaw === 'lax' ||
+    sameSiteRaw === 'strict' ||
+    sameSiteRaw === 'no_restriction'
+  ) {
+    sameSite = mapSameSiteFromApi(sameSiteRaw);
+  }
   const expirationDate =
     typeof item.expirationDate === 'number' && Number.isFinite(item.expirationDate)
       ? item.expirationDate
@@ -1386,30 +1396,24 @@ async function writeCookieViaApi(tab, key, value, options, conflictMode = 'upser
     applyCookieDetailsToForm(result);
   }
 
-  if (attributeMismatch) {
-    return {
-      ...routeInfo,
-      value: result.value,
-      success: false,
-      httpOnly: actualHttpOnly,
-      cookie: result,
-      attributeMismatch: true,
-      expectedHttpOnly: httpOnly,
-      actualHttpOnly,
-      expectedSecure: secure,
-      actualSecure,
-      prefixTip: normalizedOptions.prefixTip,
-      error: `属性未按预期生效：HttpOnly 期望 ${httpOnly} / 实际 ${actualHttpOnly}，Secure 期望 ${secure} / 实际 ${actualSecure}`,
-    };
-  }
-
+  // set 已返回 Cookie 即视为写入成功；属性/值差异只作提示，不走失败分支
+  const valueMismatched = result.value !== value;
   return {
     ...routeInfo,
     value: result.value,
-    success: result.value === value,
+    success: true,
+    valueMismatched,
+    attributeMismatch,
+    expectedHttpOnly: httpOnly,
+    actualHttpOnly,
+    expectedSecure: secure,
+    actualSecure,
     httpOnly: actualHttpOnly,
     cookie: result,
     prefixTip: normalizedOptions.prefixTip,
+    error: attributeMismatch
+      ? `属性未按预期生效：HttpOnly 期望 ${httpOnly} / 实际 ${actualHttpOnly}，Secure 期望 ${secure} / 实际 ${actualSecure}`
+      : undefined,
   };
 }
 
@@ -1439,9 +1443,8 @@ function filterCookiesByDeleteOptions(cookies, options = {}) {
       return cookieDomainNorm === optDomainNorm;
     });
   } else {
-    // Domain 为空：优先 host-only（与读取回填一致）；否则同 Path 全部
-    const hostOnlyMatches = samePath.filter((cookie) => cookie.hostOnly);
-    matched = hostOnlyMatches.length ? hostOnlyMatches : samePath;
+    // Domain 为空：仅匹配 host-only（与表单空 Domain 语义一致，避免误删同 Path 域名 Cookie）
+    matched = samePath.filter((cookie) => cookie.hostOnly);
   }
 
   // 显式传入 partitionKey（含 undefined）时按分区精确过滤
@@ -1459,7 +1462,7 @@ function filterCookiesByDeleteOptions(cookies, options = {}) {
  * 通过 chrome.cookies 删除 cookie（含 HttpOnly）
  * @param {chrome.tabs.Tab} tab
  * @param {string} key
- * @param {{ path?: string, domain?: string }} [options]
+ * @param {{ path?: string, domain?: string, partitionKey?: chrome.cookies.CookiePartitionKey }} [options]
  */
 async function deleteCookieViaApi(tab, key, options = {}) {
   const routeInfo = buildRouteInfoFromTab(tab);
@@ -1485,6 +1488,9 @@ async function deleteCookieViaApi(tab, key, options = {}) {
   if (!targets.length) {
     const storeId = tab.id ? await getTabCookieStoreId(tab.id) : undefined;
     const path = options.path || '/';
+    const partitionField = buildPartitionKeyField({
+      partitionKey: options.partitionKey,
+    });
     try {
       const parsed = new URL(tab.url || '');
       const domain = (options.domain || parsed.hostname).replace(/^\./, '');
@@ -1493,6 +1499,7 @@ async function deleteCookieViaApi(tab, key, options = {}) {
           url: `${protocol}//${domain}${path}`,
           name: key,
           ...(storeId ? { storeId } : {}),
+          ...partitionField,
         });
       }
     } catch {
@@ -1500,6 +1507,7 @@ async function deleteCookieViaApi(tab, key, options = {}) {
         url: normalizeCookieQueryUrl(tab.url || ''),
         name: key,
         ...(storeId ? { storeId } : {}),
+        ...partitionField,
       });
     }
   } else {
@@ -1957,6 +1965,43 @@ function collectAllEntriesFromTable() {
  * 从表格收集全部 cookie 详情（保留 Path/Domain/分区；含行内未保存编辑）
  * @returns {Array<ReturnType<typeof serializeCookieForExport>>}
  */
+/**
+ * 将属性栏当前选项合并为导出形态（用于脏属性或草稿）
+ * @param {string} name
+ * @param {string} value
+ * @param {chrome.cookies.Cookie | null} [preferredCookie]
+ * @returns {ReturnType<typeof serializeCookieForExport>}
+ */
+function serializeCookieOptionsForExport(name, value, preferredCookie = null) {
+  const opts = getCookieWriteOptions(preferredCookie, { applySideEffects: false });
+  // 与 serializeCookieForExport 对齐，统一导出 API 小写 sameSite
+  const sameSiteApi = mapSameSiteToApi(opts.sameSite) || '';
+  /** @type {ReturnType<typeof serializeCookieForExport>} */
+  const item = {
+    name,
+    value,
+    path: opts.path || '/',
+    domain: opts.domain || '',
+    hostOnly: !opts.domain,
+    secure: Boolean(opts.secure),
+    httpOnly: Boolean(opts.httpOnly),
+    sameSite: sameSiteApi,
+    session: opts.maxAge == null && opts.expirationDate == null,
+    expirationDate: opts.expirationDate ?? null,
+  };
+  if (opts.maxAge != null && Number.isFinite(opts.maxAge)) {
+    item.session = false;
+    item.expirationDate = Date.now() / 1000 + opts.maxAge;
+  }
+  if (opts.partitionKey && typeof opts.partitionKey === 'object') {
+    item.partitionKey = {
+      topLevelSite: opts.partitionKey.topLevelSite || '',
+      hasCrossSiteAncestor: Boolean(opts.partitionKey.hasCrossSiteAncestor),
+    };
+  }
+  return item;
+}
+
 function collectAllCookieItemsFromTable() {
   /** @type {Array<ReturnType<typeof serializeCookieForExport>>} */
   const items = [];
@@ -1968,6 +2013,11 @@ function collectAllCookieItemsFromTable() {
     }
     const detail = getCookieDetailForRow(row);
     if (detail) {
+      // 当前行属性栏有未保存改动时，以属性栏为准，避免「全部 JSON」带旧 identity
+      if (row.rowId === activeRowId && isCookieBarDirtyForActiveRow()) {
+        items.push(serializeCookieOptionsForExport(name, row.value ?? '', detail));
+        return;
+      }
       const serialized = serializeCookieForExport(detail);
       serialized.name = name;
       serialized.value = row.value ?? '';
@@ -1975,27 +2025,7 @@ function collectAllCookieItemsFromTable() {
       return;
     }
     // 草稿行：用属性栏当前选项
-    const opts = getCookieWriteOptions();
-    /** @type {ReturnType<typeof serializeCookieForExport>} */
-    const draftItem = {
-      name,
-      value: row.value ?? '',
-      path: opts.path || '/',
-      domain: opts.domain || '',
-      hostOnly: !opts.domain,
-      secure: Boolean(opts.secure),
-      httpOnly: Boolean(opts.httpOnly),
-      sameSite: opts.sameSite || '',
-      session: opts.maxAge == null && opts.expirationDate == null,
-      expirationDate: opts.expirationDate ?? null,
-    };
-    if (opts.partitionKey && typeof opts.partitionKey === 'object') {
-      draftItem.partitionKey = {
-        topLevelSite: opts.partitionKey.topLevelSite || '',
-        hasCrossSiteAncestor: Boolean(opts.partitionKey.hasCrossSiteAncestor),
-      };
-    }
-    items.push(draftItem);
+    items.push(serializeCookieOptionsForExport(name, row.value ?? '', null));
   });
   return items;
 }
@@ -2189,6 +2219,10 @@ function openAllJsonDialog(mode) {
  * @returns {Promise<boolean>} 是否已关闭
  */
 async function handleJsonDialogCloseRequest() {
+  // 写入/确认进行中忽略关闭，避免打断 showConfirmDialog
+  if (isBusy) {
+    return false;
+  }
   if (
     jsonDialogMode === 'edit' &&
     jsonDialogEditor.value !== jsonDialogBaselineText
@@ -2503,16 +2537,28 @@ async function handleJsonDialogApplyAll() {
     return;
   }
 
-  if (isCookieBarDirtyForActiveRow()) {
+  // 先持锁再确认，避免确认结束后短暂解锁可再点关闭/写入
+  setBusy(true);
+  try {
     const canDiscard = await confirmDiscardDirtyEdits('写入全部');
     if (!canDiscard) {
       setStatus('已取消写入全部', 'empty');
       return;
     }
-  }
+    if (jsonDialogMode !== 'edit' || jsonDialogScope !== 'all' || !jsonDialog.open) {
+      setStatus('写入全部已取消（弹窗已关闭）', 'empty');
+      return;
+    }
 
-  setBusy(true);
-  try {
+    // 用户已同意丢弃未保存属性：兼容模式批量写入前恢复为已写入详情，避免脏属性栏误用
+    if (currentStorageType === STORAGE_TYPES.cookie && activeRowId) {
+      const activeRow = tableRows.find((item) => item.rowId === activeRowId);
+      const savedCookie = activeRow ? getCookieDetailForRow(activeRow) : null;
+      if (savedCookie) {
+        applyCookieDetailsToForm(savedCookie);
+      }
+    }
+
     /** @type {{ mode: 'entries', entries: Record<string, string> } | { mode: 'cookieDetails', cookies: NonNullable<ReturnType<typeof normalizeImportedCookieItem>>[] }} */
     let payload;
     try {
@@ -2639,7 +2685,7 @@ async function handleJsonDialogApplyAll() {
  * 弹窗「保存」：单行=压缩写回行后写入页面存储；全部=写入全部
  */
 async function handleJsonDialogSave() {
-  if (jsonDialogMode !== 'edit') {
+  if (jsonDialogMode !== 'edit' || isBusy) {
     return;
   }
   if (jsonDialogScope === 'all') {
@@ -2657,24 +2703,30 @@ async function handleJsonDialogSave() {
   const previousValue = targetRow ? targetRow.value : '';
   const previousDomValue = getRowValueTextarea(targetRowId)?.value ?? previousValue;
 
-  // 先写回行内但不关窗，确认取消时可还原；成功后再关窗
-  const appliedRowId = applyJsonDialogToRow({ closeDialog: false, silentStatus: true });
-  if (!appliedRowId) {
-    return;
-  }
-  const saved = await handleRowSave(appliedRowId);
-  if (!saved) {
-    if (targetRow) {
-      targetRow.value = previousValue;
+  // 入口即持锁，避免 apply 后、行保存前可关闭弹窗造成「已写回行但仍在保存」
+  setBusy(true);
+  let appliedRowId = null;
+  try {
+    appliedRowId = applyJsonDialogToRow({ closeDialog: false, silentStatus: true });
+    if (!appliedRowId) {
+      return;
     }
-    const textarea = getRowValueTextarea(appliedRowId);
-    if (textarea) {
-      textarea.value = previousDomValue;
+    const saved = await handleRowSave(appliedRowId, { holdBusy: true });
+    if (!saved) {
+      if (targetRow) {
+        targetRow.value = previousValue;
+      }
+      const textarea = getRowValueTextarea(appliedRowId);
+      if (textarea) {
+        textarea.value = previousDomValue;
+      }
+      syncRowModelFromDom(appliedRowId);
+      return;
     }
-    syncRowModelFromDom(appliedRowId);
-    return;
+    closeJsonDialog();
+  } finally {
+    setBusy(false);
   }
-  closeJsonDialog();
 }
 
 /**
@@ -2706,7 +2758,7 @@ function handleJsonDialogClear() {
  * 弹窗「删除」：确认并删除成功后再关窗
  */
 async function handleJsonDialogDelete() {
-  if (jsonDialogMode !== 'edit' || jsonDialogScope !== 'row' || !jsonDialogRowId) {
+  if (jsonDialogMode !== 'edit' || jsonDialogScope !== 'row' || !jsonDialogRowId || isBusy) {
     return;
   }
   const rowId = jsonDialogRowId;
@@ -3375,6 +3427,24 @@ function setBusy(busy) {
       el.disabled = busy;
     }
   });
+  // JSON 弹层操作一并锁定，避免与确认框/保存互抢
+  [
+    jsonFormatBtn,
+    jsonCompressBtn,
+    jsonCopyBtn,
+    jsonPasteBtn,
+    jsonClearBtn,
+    jsonSaveBtn,
+    jsonDeleteBtn,
+    jsonCloseBtn,
+  ].forEach((el) => {
+    if (el instanceof HTMLButtonElement) {
+      el.disabled = busy;
+    }
+  });
+  if (jsonDialogEditor instanceof HTMLTextAreaElement) {
+    jsonDialogEditor.disabled = busy;
+  }
   // 忙碌时禁止切换类型，避免半写入状态交错
   storageTypeTabsEl.querySelectorAll('.tab-item').forEach((button) => {
     if (button instanceof HTMLButtonElement) {
@@ -3642,6 +3712,23 @@ function closeFilterDropdown() {
 }
 
 /**
+ * 筛选竞态后按「当前最终 keyword」纠偏选中行与 Cookie 属性栏
+ */
+async function reconcileActiveRowAfterFilterRace() {
+  const visibleRows = tableRows.filter(isRowMatchFilter);
+  if (activeRowId && !visibleRows.some((row) => row.rowId === activeRowId)) {
+    await setActiveRow(visibleRows[0]?.rowId || null, {
+      syncCookie: true,
+      skipAttrConfirm: true,
+    });
+    return;
+  }
+  if (activeRowId) {
+    await setActiveRow(activeRowId, { syncCookie: true, skipAttrConfirm: true });
+  }
+}
+
+/**
  * 应用筛选关键字并刷新表格
  * @param {string} keyword
  * @param {{ pushHistory?: boolean, closeDropdown?: boolean }} [options]
@@ -3652,6 +3739,39 @@ async function applyKeysFilterKeyword(keyword, options = {}) {
     return;
   }
   const nextKeyword = String(keyword ?? '');
+  const previousFilterKeyword = filterKeyword;
+  const seq = ++filterInputSeq;
+
+  tableRows.forEach((row) => syncRowModelFromDom(row.rowId));
+
+  // 预判：应用后当前行是否仍可见（确认前不改 UI，避免先跳变）
+  const wouldHideActive =
+    Boolean(activeRowId) &&
+    !tableRows.some(
+      (row) => row.rowId === activeRowId && isRowMatchFilterWithKeyword(row, nextKeyword)
+    );
+
+  if (wouldHideActive && isCookieBarDirtyForActiveRow()) {
+    const canDiscard = await confirmDiscardDirtyEdits('筛选');
+    if (seq !== filterInputSeq) {
+      return;
+    }
+    if (!canDiscard) {
+      // 取消：恢复进入前的筛选词，保持当前行与属性栏
+      keysFilterInput.value = previousFilterKeyword;
+      filterKeyword = previousFilterKeyword;
+      syncFilterClearButton();
+      if (closeDropdown) {
+        closeFilterDropdown();
+      } else {
+        refreshFilterSuggestions();
+      }
+      renderStorageTable();
+      void setActiveRow(activeRowId, { syncCookie: false, skipAttrConfirm: true });
+      return;
+    }
+  }
+
   keysFilterInput.value = nextKeyword;
   filterKeyword = nextKeyword;
   syncFilterClearButton();
@@ -3661,45 +3781,38 @@ async function applyKeysFilterKeyword(keyword, options = {}) {
     refreshFilterSuggestions();
   }
 
-  const seq = ++filterInputSeq;
-  tableRows.forEach((row) => syncRowModelFromDom(row.rowId));
+  if (seq !== filterInputSeq) {
+    return;
+  }
+
   renderStorageTable();
   const visibleRows = tableRows.filter(isRowMatchFilter);
   if (activeRowId && !visibleRows.some((row) => row.rowId === activeRowId)) {
     const nextId = visibleRows[0]?.rowId || null;
     const previousActiveId = activeRowId;
-    const previousKeyword = nextKeyword;
-    // 属性栏有未保存改动时先确认，避免筛选静默冲掉
-    if (isCookieBarDirtyForActiveRow()) {
-      const canDiscard = await confirmDiscardDirtyEdits('筛选');
-      if (seq !== filterInputSeq) {
-        return;
-      }
-      if (!canDiscard) {
-        // 取消：清空筛选以继续编辑当前行属性
-        keysFilterInput.value = '';
-        filterKeyword = '';
-        filterInputSeq += 1;
-        syncFilterClearButton();
-        renderStorageTable();
-        void setActiveRow(previousActiveId, { syncCookie: false, skipAttrConfirm: true });
-        return;
-      }
-    }
-    const switched = await setActiveRow(nextId, { syncCookie: true, skipAttrConfirm: true });
+    // 切行前再校验序号，避免过期回调改 active / 属性栏
     if (seq !== filterInputSeq) {
       return;
     }
-    if (!switched) {
-      void setActiveRow(previousActiveId, { syncCookie: false, skipAttrConfirm: true });
+    const switched = await setActiveRow(nextId, { syncCookie: true, skipAttrConfirm: true });
+    if (seq !== filterInputSeq) {
+      await reconcileActiveRowAfterFilterRace();
       return;
     }
-    void previousKeyword;
-  } else if (activeRowId) {
+    if (!switched) {
+      keysFilterInput.value = previousFilterKeyword;
+      filterKeyword = previousFilterKeyword;
+      filterInputSeq += 1;
+      syncFilterClearButton();
+      renderStorageTable();
+      void setActiveRow(previousActiveId, { syncCookie: true, skipAttrConfirm: true });
+      return;
+    }
+  } else if (activeRowId && seq === filterInputSeq) {
     void setActiveRow(activeRowId, { syncCookie: false, skipAttrConfirm: true });
   }
 
-  if (pushHistory) {
+  if (pushHistory && seq === filterInputSeq) {
     void pushFilterHistory(nextKeyword);
   }
 }
@@ -3814,11 +3927,17 @@ function createDraftRow() {
  * @param {TableRowModel} row
  * @returns {boolean}
  */
-function isRowMatchFilter(row) {
+/**
+ * 按指定关键字判断行是否匹配筛选
+ * @param {TableRowModel} row
+ * @param {string} keywordRaw
+ * @returns {boolean}
+ */
+function isRowMatchFilterWithKeyword(row, keywordRaw) {
   if (row.isDraft) {
     return true;
   }
-  const keyword = filterKeyword.trim().toLowerCase();
+  const keyword = String(keywordRaw || '').trim().toLowerCase();
   if (!keyword) {
     return true;
   }
@@ -3835,6 +3954,10 @@ function isRowMatchFilter(row) {
     return name.includes(keyword) || path.includes(keyword) || domain.includes(keyword);
   }
   return false;
+}
+
+function isRowMatchFilter(row) {
+  return isRowMatchFilterWithKeyword(row, filterKeyword);
 }
 
 /**
@@ -4448,65 +4571,72 @@ async function readExistingForSave(tab, key, row) {
 /**
  * 行内保存
  * @param {string} rowId
+ * @param {{ holdBusy?: boolean }} [options] holdBusy：调用方已持锁时勿在 finally 释放
  * @returns {Promise<boolean>} 是否写入成功
  */
-async function handleRowSave(rowId) {
-  if (isBusy) {
+async function handleRowSave(rowId, options = {}) {
+  const { holdBusy = false } = options;
+  if (isBusy && !holdBusy) {
     return false;
   }
 
-  syncRowModelFromDom(rowId);
-  const row = tableRows.find((item) => item.rowId === rowId);
-  if (!row) {
-    return false;
+  // 尽早持锁，避免 prepare/校验窗口被关闭或连点打断
+  const ownedBusy = !isBusy;
+  if (ownedBusy) {
+    setBusy(true);
   }
-
-  const key = row.key.trim();
-  if (!key) {
-    setStatus('请输入 key', 'error');
-    getRowKeyInput(rowId)?.focus();
-    return false;
-  }
-
-  const textarea = getRowValueTextarea(rowId);
-  if (!textarea) {
-    // 行可能被筛选隐藏：用模型值继续，避免静默失败
-    if (!row.value) {
-      setStatus('没有可写入的值（行可能被筛选隐藏且值为空）', 'error');
-      return false;
-    }
-  } else if (!textarea.value) {
-    setStatus('请先粘贴或输入要写入的值（空字符串拒绝写入）', 'error');
-    textarea.focus();
-    return false;
-  }
-
-  ensureFormatBoundToRow(rowId);
-  const prepared = prepareValueForWrite(textarea ? textarea.value : row.value);
-  const value = prepared.text;
-  const keptEditsOnWrite = formatExpandDirty && prepared.restoredCount > 0;
-
-  // 保存前先把压缩结果回写到单元格，与「编辑自动格式化」对称
-  if (textarea && value !== textarea.value) {
-    textarea.value = value;
-    syncRowModelFromDom(rowId);
-  } else if (!textarea) {
-    row.value = value;
-  }
-
-  const isStorageRename =
-    !row.isDraft &&
-    row.originKey != null &&
-    row.originKey !== key &&
-    currentStorageType !== STORAGE_TYPES.cookie;
-
-  const oldCookieDetail =
-    currentStorageType === STORAGE_TYPES.cookie && !row.isDraft
-      ? getCookieDetailForRow(row)
-      : null;
 
   try {
-    setBusy(true);
+    syncRowModelFromDom(rowId);
+    const row = tableRows.find((item) => item.rowId === rowId);
+    if (!row) {
+      return false;
+    }
+
+    const key = row.key.trim();
+    if (!key) {
+      setStatus('请输入 key', 'error');
+      getRowKeyInput(rowId)?.focus();
+      return false;
+    }
+
+    const textarea = getRowValueTextarea(rowId);
+    if (!textarea) {
+      // 行可能被筛选隐藏：用模型值继续，避免静默失败
+      if (!row.value) {
+        setStatus('没有可写入的值（行可能被筛选隐藏且值为空）', 'error');
+        return false;
+      }
+    } else if (!textarea.value) {
+      setStatus('请先粘贴或输入要写入的值（空字符串拒绝写入）', 'error');
+      textarea.focus();
+      return false;
+    }
+
+    ensureFormatBoundToRow(rowId);
+    const prepared = prepareValueForWrite(textarea ? textarea.value : row.value);
+    const value = prepared.text;
+    const keptEditsOnWrite = formatExpandDirty && prepared.restoredCount > 0;
+
+    // 保存前先把压缩结果回写到单元格，与「编辑自动格式化」对称
+    if (textarea && value !== textarea.value) {
+      textarea.value = value;
+      syncRowModelFromDom(rowId);
+    } else if (!textarea) {
+      row.value = value;
+    }
+
+    const isStorageRename =
+      !row.isDraft &&
+      row.originKey != null &&
+      row.originKey !== key &&
+      currentStorageType !== STORAGE_TYPES.cookie;
+
+    const oldCookieDetail =
+      currentStorageType === STORAGE_TYPES.cookie && !row.isDraft
+        ? getCookieDetailForRow(row)
+        : null;
+
     const tab = await getActiveTab();
     assertInjectableTab(tab);
 
@@ -4775,7 +4905,8 @@ async function handleRowSave(rowId) {
     }
 
     // Cookie 改名/改 Path/Domain：写入新 identity 成功后，删除旧 identity（含 partitionKey）
-    if (cookieIdentityChanged && oldCookieDetail) {
+    // 属性未按预期时保留旧条目，避免「新属性不对却删掉原 Cookie」
+    if (cookieIdentityChanged && oldCookieDetail && !pageData.attributeMismatch) {
       await chrome.cookies.remove({
         url: buildCookieUrl(oldCookieDetail, tab),
         name: oldCookieDetail.name,
@@ -4845,9 +4976,22 @@ async function handleRowSave(rowId) {
       prepareTip = '，已压缩';
     }
 
+    let valueNormTip = '';
+    if (currentStorageType === STORAGE_TYPES.cookie && pageData.valueMismatched) {
+      valueNormTip = '；浏览器返回值与写入值略有差异（已按回读结果展示）';
+    }
+    let attrMismatchTip = '';
+    if (currentStorageType === STORAGE_TYPES.cookie && pageData.attributeMismatch) {
+      attrMismatchTip = `；${pageData.error || '部分属性未按预期生效'}`;
+      if (cookieIdentityChanged) {
+        attrMismatchTip += '；旧条目已保留，请刷新后核对';
+      }
+    }
+
+    const statusTone = pageData.attributeMismatch ? 'error' : 'success';
     setStatus(
-      `写入成功：${getStorageTypeLabel(currentStorageType)} / ${key}（长度 ${value.length}）${cookieTip}${prepareTip}`,
-      'success'
+      `写入成功：${getStorageTypeLabel(currentStorageType)} / ${key}（长度 ${value.length}）${cookieTip}${prepareTip}${valueNormTip}${attrMismatchTip}`,
+      statusTone
     );
 
     await refreshAndRenderTable({
@@ -4861,7 +5005,9 @@ async function handleRowSave(rowId) {
     setStatus(error instanceof Error ? error.message : '写入失败', 'error');
     return false;
   } finally {
-    setBusy(false);
+    if (ownedBusy) {
+      setBusy(false);
+    }
   }
 }
 

@@ -2,7 +2,7 @@
 
 Chrome Manifest V3 浏览器扩展，用于管理当前页面的 **localStorage**、**sessionStorage** 与 **Cookie**（含 HttpOnly）。
 
-当前版本：`2.1.5`
+当前版本：`2.1.6`
 
 ## 界面预览
 
@@ -60,7 +60,7 @@ Chrome Manifest V3 浏览器扩展，用于管理当前页面的 **localStorage*
 
 ## 导入 / 导出
 
-导出为 JSON v2；Cookie 额外带 `cookies[]`。导入时：
+导出为 JSON v2；Cookie 额外带 `cookies[]`（完整详情，同名多 Path 不合并）。`data{}` 仅为兼容折叠（同名只保留第一条），导入请优先用 `cookies[]`。
 
 - `{ cookies: [...] }`：按条自身属性精确写入
 - `{ data }` / 纯对象：按当前类型写入；Cookie 用属性栏
