@@ -292,7 +292,14 @@ function listPageStorageKeys(storageType) {
  * @param {Record<string, string>} entries
  * @param {{ path?: string, maxAge?: number | null, domain?: string, secure?: boolean, sameSite?: string }} [cookieOptions]
  */
-function writePageStorageBatch(storageType, entries, cookieOptions = {}) {
+/**
+ * 在页面上下文中批量写入；可选删除未出现在 entries 中的旧 key（改名同步）
+ * @param {string} storageType
+ * @param {Record<string, string>} entries
+ * @param {object} [cookieOptions]
+ * @param {string[]} [removeKeys]
+ */
+function writePageStorageBatch(storageType, entries, cookieOptions = {}, removeKeys = []) {
   const routeInfo = {
     href: window.location.href,
     hash: window.location.hash,
@@ -325,6 +332,8 @@ function writePageStorageBatch(storageType, entries, cookieOptions = {}) {
 
   let successCount = 0;
   let failCount = 0;
+  let removedCount = 0;
+  let removeFailCount = 0;
   const entryList = Object.entries(entries || {});
 
   for (const [key, rawValue] of entryList) {
@@ -382,7 +391,41 @@ function writePageStorageBatch(storageType, entries, cookieOptions = {}) {
     }
   }
 
-  return { ...routeInfo, successCount, failCount, total: entryList.length };
+  // 删除 JSON 中未出现的旧 key（改名后否则旧名会残留）
+  const toRemove = Array.isArray(removeKeys) ? removeKeys : [];
+  for (const key of toRemove) {
+    if (!key) {
+      continue;
+    }
+    try {
+      if (storageType === 'localStorage') {
+        window.localStorage.removeItem(key);
+        if (window.localStorage.getItem(key) === null) {
+          removedCount += 1;
+        } else {
+          removeFailCount += 1;
+        }
+      } else if (storageType === 'sessionStorage') {
+        window.sessionStorage.removeItem(key);
+        if (window.sessionStorage.getItem(key) === null) {
+          removedCount += 1;
+        } else {
+          removeFailCount += 1;
+        }
+      }
+    } catch {
+      removeFailCount += 1;
+    }
+  }
+
+  return {
+    ...routeInfo,
+    successCount,
+    failCount,
+    removedCount,
+    removeFailCount,
+    total: entryList.length,
+  };
 }
 
 /**
@@ -2629,15 +2672,61 @@ async function handleJsonDialogApplyAll() {
     const skipTip = skippedEmpty.length
       ? `\n\n将跳过 ${skippedEmpty.length} 个空值（清空请用删除）。`
       : '';
+
+    // local/session：检测 JSON 中缺失的已有 key（改名后旧名会残留）
+    /** @type {string[]} */
+    let missingKeys = [];
+    if (
+      payload.mode === 'entries' &&
+      (currentStorageType === STORAGE_TYPES.localStorage ||
+        currentStorageType === STORAGE_TYPES.sessionStorage)
+    ) {
+      const nextKeySet = new Set(Object.keys(payload.entries));
+      missingKeys = Object.keys(pageEntriesCache).filter((key) => !nextKeySet.has(key));
+    }
+
+    let missingTip = '';
+    if (missingKeys.length) {
+      const missingPreview = missingKeys
+        .slice(0, 8)
+        .map((key) => `- ${key}`)
+        .join('\n');
+      const missingMore = missingKeys.length > 8 ? `\n…共 ${missingKeys.length} 个` : '';
+      missingTip = `\n\n另有 ${missingKeys.length} 个已有 key 不在 JSON 中（改名/删除时常见）。下一步将询问是否删除旧 key，否则旧名会保留、看起来像改名未生效：\n${missingPreview}${missingMore}`;
+    } else if (payload.mode === 'entries') {
+      missingTip = '\n\n（当前 JSON 已覆盖全部已有 key，无需删除旧项）';
+    } else {
+      missingTip = '\n\n（不会删除未出现在 JSON 中的项）';
+    }
+
     const confirmed = await showConfirmDialog({
       title: `确认写入全部到 ${getStorageTypeLabel(currentStorageType)}？`,
-      body: `将写入 / 覆盖以下条目（不会删除未出现在 JSON 中的项）：\n${preview}${moreTip}${skipTip}${cookieTip}`,
+      body: `将写入 / 覆盖以下条目：\n${preview}${moreTip}${skipTip}${cookieTip}${missingTip}`,
       okText: '确认写入',
       danger: true,
     });
     if (!confirmed) {
       setStatus('已取消写入全部', 'empty');
       return;
+    }
+
+    /** @type {string[]} */
+    let keysToRemove = [];
+    if (missingKeys.length) {
+      const missingPreview = missingKeys
+        .slice(0, 12)
+        .map((key) => `- ${key}`)
+        .join('\n');
+      const missingMore = missingKeys.length > 12 ? `\n…共 ${missingKeys.length} 个` : '';
+      const deleteConfirmed = await showConfirmDialog({
+        title: '是否删除 JSON 中缺失的旧 key？',
+        body: `以下 key 仍在页面存储中，但不在本次 JSON 里。\n在「全部 JSON」里改 key 名时，若不删除旧名，旧 key 会一直残留：\n${missingPreview}${missingMore}\n\n建议改名/删除时选择删除；若只想增补覆盖、保留其它 key，请取消。`,
+        okText: '删除这些旧 key',
+        danger: true,
+      });
+      if (deleteConfirmed) {
+        keysToRemove = missingKeys;
+      }
     }
 
     setStatus('批量写入中...');
@@ -2654,6 +2743,7 @@ async function handleJsonDialogApplyAll() {
         currentStorageType,
         payload.entries,
         null,
+        keysToRemove,
       ]);
     }
 
@@ -2661,14 +2751,22 @@ async function handleJsonDialogApplyAll() {
     closeJsonDialog();
     const successCount = result?.successCount ?? totalCount;
     const failCount = result?.failCount ?? 0;
+    const removedCount = result?.removedCount ?? 0;
+    const removeFailCount = result?.removeFailCount ?? 0;
     const skipSuffix = skippedEmpty.length ? `，跳过空值 ${skippedEmpty.length}` : '';
-    if (failCount > 0) {
+    const removeSuffix =
+      removedCount > 0 || removeFailCount > 0
+        ? `，删除旧 key ${removedCount}${removeFailCount ? `（失败 ${removeFailCount}）` : ''}`
+        : keysToRemove.length === 0 && missingKeys.length > 0
+          ? '，已保留 JSON 外的旧 key'
+          : '';
+    if (failCount > 0 || removeFailCount > 0) {
       setStatus(
-        `批量写入完成：成功 ${successCount}，失败 ${failCount}${skipSuffix}`,
+        `批量写入完成：成功 ${successCount}，失败 ${failCount}${skipSuffix}${removeSuffix}`,
         'error'
       );
     } else {
-      setStatus(`已写入全部 ${successCount} 条${skipSuffix}`, 'success');
+      setStatus(`已写入全部 ${successCount} 条${skipSuffix}${removeSuffix}`, 'success');
     }
     await refreshAndRenderTable();
   } catch (error) {
@@ -3510,6 +3608,17 @@ async function loadFilterHistoryCache() {
 }
 
 /**
+ * 清空当前类型的最近筛选历史
+ */
+async function clearFilterHistory() {
+  const field = getFilterHistoryField(currentStorageType);
+  filterHistoryCache = [];
+  await chrome.storage.local.set({ [field]: [] });
+  refreshFilterSuggestions();
+  setStatus('已清除最近筛选', 'success');
+}
+
+/**
  * 写入筛选历史（去重置顶，最多 5 条）
  * @param {string} keyword
  */
@@ -3607,7 +3716,12 @@ function refreshFilterSuggestions() {
   const parts = [];
   let flatIndex = 0;
   if (groups.history.length) {
-    parts.push(`<div class="keys-filter-group-label">最近筛选</div>`);
+    parts.push(
+      `<div class="keys-filter-group-label">` +
+        `<span class="keys-filter-group-title">最近筛选</span>` +
+        `<button type="button" class="keys-filter-history-clear" data-action="clear-filter-history" title="清除最近筛选">清除</button>` +
+        `</div>`
+    );
     groups.history.forEach((value) => {
       parts.push(
         `<button type="button" class="keys-filter-option" role="option" data-index="${flatIndex}" data-kind="history" title="${escapeHtml(value)}">${escapeHtml(value)}</button>`
@@ -5886,6 +6000,14 @@ async function initPopup() {
     keysFilterDropdown.addEventListener('click', (event) => {
       const target = event.target;
       if (!(target instanceof HTMLElement)) {
+        return;
+      }
+      // 清除最近筛选历史
+      if (target.closest('[data-action="clear-filter-history"]')) {
+        event.preventDefault();
+        if (!isBusy) {
+          void clearFilterHistory();
+        }
         return;
       }
       const option = target.closest('.keys-filter-option');

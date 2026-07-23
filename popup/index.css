@@ -136,6 +136,10 @@ body {
   position: sticky;
   top: 0;
   z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   margin: 0;
   padding: 7px 10px 7px 12px;
   border-bottom: 1px solid #dbe4f0;
@@ -146,6 +150,31 @@ body {
   font-weight: 600;
   letter-spacing: 0.04em;
   line-height: 1.2;
+}
+
+.keys-filter-group-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.keys-filter-history-clear {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0 2px;
+  border: none;
+  background: transparent;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.keys-filter-history-clear:hover {
+  color: #dc2626;
 }
 
 .keys-filter-group-label + .keys-filter-option {
