@@ -1,6 +1,6 @@
 # 应用存储管理
 
-Chrome Manifest V3 浏览器扩展：在弹窗中表格化管理当前页面的 **localStorage**、**sessionStorage** 与 **Cookie**（含 HttpOnly、分区 Cookie）。
+Chrome Manifest V3 浏览器扩展（仓库目录：`storageInspector`，npm 包名：`storage-inspector`）：在弹窗中表格化管理当前页面的 **localStorage**、**sessionStorage** 与 **Cookie**（含 HttpOnly、分区 Cookie）。
 
 当前版本：`2.1.7`
 

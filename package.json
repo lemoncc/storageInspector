@@ -1,5 +1,5 @@
 {
-  "name": "browser-extension",
+  "name": "storage-inspector",
   "private": true,
   "description": "应用存储管理 Chrome 扩展（开发类型声明）",
   "devDependencies": {
